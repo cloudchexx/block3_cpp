@@ -78,6 +78,38 @@ convert_raw_to_blocked(raw, output, dx, dy, dz,
 - 缓存预热：`warm_up()`、`wait_warm_up()`。
 - 元数据：尺寸、块大小、块总数、数据偏移和布局 getter。
 
+## `benchmark_cache.hpp` — 冷/热缓存 benchmark 接口
+
+定义 `block3d_benchmark_cache` 库的公共接口，供 `block3d_cli bench` 和 `run_test` 共用：
+
+### 缓存模式枚举
+
+- `CacheMode`：`Cold` / `Hot` / `Both`
+- `ColdMethod`：`Scrub` / `None`
+- `ColdIsolation`：`Suite`（计划级一次 scrub）/ `Case`（每 case 前重新 scrub）
+- `WarmupScope`：`Dataset`（预热整个数据区）/ `Workload`（预热计划工作集）
+
+### 数据结构
+
+- `CacheOptions`：benchmark 缓存阶段完整参数（mode、method、isolation、scope、scrub 文件路径、ratio、passes、settle 时间）。
+- `CachePrepareOptions` / `CachePrepareResult`：scrub 文件一次性准备输入/输出。
+- `CacheScrubResult`：scrub 执行结果（字节数、校验和、耗时、状态消息）。
+
+### 辅助函数
+
+- `to_string()` / `parse_*()`：枚举与字符串双向转换。
+- `cache_mode_has_cold()` / `cache_mode_has_hot()`：`Both` 同时满足两者。
+- `query_system_page_size()`、`query_physical_memory_bytes()`、`required_scrub_bytes()`：平台内存查询。
+- `parse_size_bytes()`：`"2G"` / `"512M"` 风格容量解析。
+- `fnv1a64_update()` / `fnv1a64_u64()`：校验和工具函数。
+- `prepare_cache_scrub_file()`：用 `splitmix64` 伪随机数据创建可复用 scrub 文件。
+- `run_cache_scrub()`：用普通 buffered I/O 逐页读取 scrub 文件，生成 cold_scrubbed 效果。
+
+```text
+benchmark_cache.hpp  ← 公有接口
+src/benchmark_cache.cpp  ← 实现
+```
+
 输出布局：
 
 ```text

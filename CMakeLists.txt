@@ -26,7 +26,7 @@ endif()
 add_library(block3d_benchmark_cache
     src/benchmark_cache.cpp
 )
-target_include_directories(block3d_benchmark_cache PUBLIC include PRIVATE src)
+target_include_directories(block3d_benchmark_cache PUBLIC include)
 
 add_executable(block3d_cli src/cli.cpp)
 target_link_libraries(block3d_cli PRIVATE block3d block3d_benchmark_cache)

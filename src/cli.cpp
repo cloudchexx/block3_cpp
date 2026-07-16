@@ -1,7 +1,7 @@
 #include "block3d/reader.hpp"
 #include "block3d/converter.hpp"
 #include "block3d/rng.hpp"
-#include "benchmark_cache.hpp"
+#include "block3d/benchmark_cache.hpp"
 #include <iostream>
 #include <fstream>
 #include <string>

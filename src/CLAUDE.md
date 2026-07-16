@@ -32,7 +32,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `cli.cpp` 的 `verify` 参数顺序固定为 `<b3d> <raw>`。
 - 顶层 `main()` 必须捕获库异常并以非零退出码报告，避免 Windows fast-fail。
 - `block3d_cli bench` 只测读取；`run_test.cpp` 测读取、输出写盘和可选同步。修改输出时保持两种口径的区别清晰。
-- `benchmark_cache.cpp` 只服务 benchmark 私有逻辑：cache mode 参数、scrub 文件创建/读取、页面大小/物理内存查询、phase 日志和 plan hash。不要把自动 scrub 或自动完整预热塞进 reader 构造函数。
+- `benchmark_cache.cpp` 只服务 benchmark 私有逻辑：cache mode 参数、scrub 文件创建/读取、页面大小/物理内存查询、phase 日志和 plan hash。不要把自动 scrub 或自动完整预热塞进 reader 构造函数。公有接口位于 `include/block3d/benchmark_cache.hpp`。
 - `block3d_cli bench` 和 `run_test` 默认 `--cache-mode both`，先 cold 再 hot；`--warm-up` 保持旧脚本兼容，但语义是 hot-only。`--warm-up` 与 `--cache-mode cold/both` 冲突时必须报错。
 - cold scrub 成功条件包括 scrub 文件存在、容量满足本轮 ratio、完整读取、逐页触碰、访问尾字节、checksum 输出和 settle 等待；失败时不输出 cold 成绩、不降级。
 - cold/hot 阶段必须复用同一不可变请求计划并输出 `PLAN_HASH`；reader 在各 phase 重新创建，避免把 reader 内部缓存收益混入 OS 页缓存对比。
