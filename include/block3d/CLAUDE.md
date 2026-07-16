@@ -15,6 +15,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `read_subvolume()` 使用半开区间 `[start, end)`。
 - `MappedFile` 的 Windows 和 POSIX 状态成员不同；移动、关闭和映射实现必须分别受平台条件保护。
 - `sorted_block_list()` 必须返回副本。缓存 mutex 释放后不能暴露 `unordered_map` 内部 vector 的引用。
+- `detect_storage_medium()` 的输出仅作启发参考，不可硬编码为唯一策略。阈值需同时适配 HDD、SSD 和 NVMe。
+- `auto_block_size()` 返回值区间为 [16, 256] 且为 4 的倍数。新增介质类型时须同步更新目标块数，并考虑维度乘积约束。
 - 新增或修改公共 API 后，更新本目录 `code_map.md`，并在 `tests/test_block3d.cpp` 增加对应覆盖。
 
 ## 验证

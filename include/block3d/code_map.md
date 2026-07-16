@@ -17,6 +17,12 @@ block data
 
 ## `core.hpp` — 块几何与 Morton 顺序
 
+### Storage classification and adaptive block sizing
+
+- `StorageClass` 枚举：`HDD`、`SSD`、`NVMe`、`Unknown`。
+- `detect_storage_medium(output_dir)`：在目标目录执行 5 轮 1MiB 写入+fsync 测试，取中位延迟对照阈值分类。若无有效数据则返回 `Unknown`。
+- `auto_block_size(dim_x, dim_y, dim_z, medium)`：将维度排序，在最差轴切片触及的目标块数约束下，扫描 16–256（步长 8）寻找最小可用块大小。HDD 目标为 ≤400 块以减少寻道，SSD/NVMe 目标为 ≤2000 块以平衡传输效率。
+
 ### Morton helpers
 
 - `spread_bits()` / `compact_bits()`

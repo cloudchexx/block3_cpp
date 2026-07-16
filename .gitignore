@@ -8,6 +8,9 @@ build/
 # Logs
 logs/
 
+# Benchmark output (large raw slice files)
+benchmark_output/
+
 # Python
 generator_py/__pycache__/
 *.pyc

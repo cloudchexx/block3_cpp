@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 注意：
 
-1.使用jujutsu进行项目管理，你拥有对应的skill
+1.你需要做好项目的版本管理，方便出错各种情况下的版本回滚，使用jujutsu进行项目管理，你拥有对应的skill
 
 2.注意windows powershell命令格式，你拥有对应的skill
 
@@ -78,6 +78,23 @@ BlockedFileReader
 - 批量读取的线程安全依赖块列表缓存按值返回；不要改成锁外持有缓存内部引用。
 - 性能结果依赖 OS 页缓存。描述或比较数据时必须说明冷缓存、转换后缓存、验证后缓存或显式 warm-up 状态。
 - Python 生成器默认写 `3DDF` 自定义头；只有 CLI `--no-header` 生成的文件可直接交给 C++ 转换器。
+
+## 自适应块大小与存储检测
+
+- `convert` 默认不再固定 block_size=32。未指定 `--block-size` 时，程序会在输出目录执行 5 轮 1MiB 写入+fsync 探测，根据中位延迟将存储分类为 HDD / SSD / NVMe / Unknown。
+- `auto_block_size()` 根据数据维度和介质类型选择块大小（范围 16–256，步长 8）：HDD 优先减少寻道（目标≤400 块/切片），SSD/NVMe 在减少传输浪费和块数之间取得平衡（目标≤2000 块/切片）。
+- 若需固定块大小，仍然支持 `--block-size N` 显式覆盖。
+
+## 切片内并行
+
+- `read_x_slice` / `read_y_slice` / `read_z_slice` 现已支持切片内多线程块处理。当块数 > `num_threads × 4` 时，已排序的块列表会跨线程分片，各线程写入输出缓冲区中不重叠的 `(Y,Z)` / `(X,Z)` / `(X,Y)` 区域。
+- `read_slices_batch` 已简化为顺序派发，因为每次 `read_slice` 调用已在内部使用全部线程——顺序处理可避免超额订阅。
+
+## 预热
+
+- 两个 benchmark 入口（`block3d_cli bench` 和 `run_test`）均支持 `--warm-up`。该选项在计时开始前将全部数据区顺序加载到 OS 页缓存中。
+- 预热使用 `PrefetchVirtualMemory`（Windows）/ `madvise(MADV_WILLNEED)`（Linux），并在不支持时回退到手动页触摸。
+- 预热后的 benchmark 结果是热缓存数据——仅供诊断，并非冷缓存性能基准。
 
 ## 修改后的验证范围
 

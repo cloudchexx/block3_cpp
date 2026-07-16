@@ -8,7 +8,15 @@
       "Bash(jj config *)",
       "Bash(jj metaedit *)",
       "Bash(jj git *)",
-      "Bash(jj bookmark *)"
+      "Bash(jj bookmark *)",
+      "Bash(cmake --build build --config Release)",
+      "Bash(ctest --test-dir build -C Release --output-on-failure)",
+      "Bash(cmake --build build --config Release --target test_cli)",
+      "Bash(build/Release/block3d_cli.exe convert *)",
+      "Bash(python3 -c ' *)",
+      "Bash(build/Release/run_test.exe --datasets test18 --warm-up --mode random --axis all)",
+      "Bash(build/Release/run_test.exe --datasets test18 --warm-up --mode sequential --axis all)",
+      "Bash(jj --no-pager bookmark list)"
     ]
   }
 }

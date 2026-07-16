@@ -165,7 +165,7 @@ int main(int argc, char* argv[]) {
     // 1. convert raw -> b3d (output is 2nd positional; sanity baseline).
     expect_ok("convert <raw> <b3d>",
               q(cli) + " convert " + q(raw) + " " + q(b3d) +
-              " --dim-x 16 --dim-y 20 --dim-z 24 --block-size 8 --threads 2 --no-progress");
+              " --dim-x 16 --dim-y 20 --dim-z 24 --block-size 16 --threads 2 --no-progress");
 
     // 2. verify with the canonical order <b3d> <raw> (b3d first).
     //    Regression for the arg-order bug: this is the natural invocation that

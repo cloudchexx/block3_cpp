@@ -141,6 +141,37 @@ void MappedFile::prefault(size_t offset, size_t length, size_t stride) {
     (void)sink;
 }
 
+// ── Intra-slice block-processing helper ───────────────────────────────
+// Blocks within a single slice write to non-overlapping regions of the
+// output buffer, so they can safely run in parallel without locks.
+// Falls back to serial when block_count ≤ num_threads × 4.
+
+namespace {
+
+template<typename F>
+void for_each_block_parallel(int num_threads,
+                              const std::vector<BlockCoord>& blocks,
+                              F&& process) {
+    size_t nb = blocks.size();
+    int nt = num_threads;
+    if (nt <= 1 || nb <= static_cast<size_t>(nt) * 4) {
+        for (size_t i = 0; i < nb; i++) process(blocks[i]);
+        return;
+    }
+    size_t nw = static_cast<size_t>(nt);
+    if (nw > nb) nw = nb;
+    std::vector<std::thread> threads;
+    threads.reserve(nw);
+    for (size_t t = 0; t < nw; t++) {
+        threads.emplace_back([&, t]() {
+            for (size_t i = t; i < nb; i += nw) process(blocks[i]);
+        });
+    }
+    for (auto& th : threads) th.join();
+}
+
+} // anonymous namespace
+
 // ── BlockedFileReader ─────────────────────────────────────────────────
 
 BlockedFileReader::BlockedFileReader(const std::string& file_path,
@@ -318,25 +349,29 @@ std::vector<float> BlockedFileReader::read_x_slice(uint64_t x) {
     uint32_t bx = static_cast<uint32_t>(x / bs);
     uint32_t lx = static_cast<uint32_t>(x % bs);
 
-    for (const auto& c : sorted_block_list('x', x)) {
-        if (c.bx != bx) continue;
+    auto blocks = sorted_block_list('x', x);
 
-        uint64_t y0 = static_cast<uint64_t>(c.by_) * bs;
-        uint64_t z0 = static_cast<uint64_t>(c.bz) * bs;
-        uint64_t ny_part = std::min(bs, dim_y_ - y0);
-        uint64_t nz_part = std::min(bs, dim_z_ - z0);
+    for_each_block_parallel(num_threads_, blocks,
+        [&](const BlockCoord& c) {
+            if (c.bx != bx) return;
 
-        uint64_t boff = block_offset_float(c.bx, c.by_, c.bz);
-        const float* src = dv + boff + static_cast<uint64_t>(lx) * bs * bs;
+            uint64_t y0 = static_cast<uint64_t>(c.by_) * bs;
+            uint64_t z0 = static_cast<uint64_t>(c.bz) * bs;
+            uint64_t ny_part = std::min(bs, dim_y_ - y0);
+            uint64_t nz_part = std::min(bs, dim_z_ - z0);
 
-        for (uint64_t ly = 0; ly < ny_part; ly++) {
-            float* dst = &result[(y0 + ly) * nz + z0];
-            const float* srow = src + ly * bs;
-            for (uint64_t lz = 0; lz < nz_part; lz++) {
-                dst[lz] = srow[lz];
+            uint64_t boff = block_offset_float(c.bx, c.by_, c.bz);
+            const float* src = dv + boff + static_cast<uint64_t>(lx) * bs * bs;
+
+            for (uint64_t ly = 0; ly < ny_part; ly++) {
+                float* dst = &result[(y0 + ly) * nz + z0];
+                const float* srow = src + ly * bs;
+                for (uint64_t lz = 0; lz < nz_part; lz++) {
+                    dst[lz] = srow[lz];
+                }
             }
-        }
-    }
+        });
+
     return result;
 }
 
@@ -354,26 +389,30 @@ std::vector<float> BlockedFileReader::read_y_slice(uint64_t y) {
     uint32_t by_ = static_cast<uint32_t>(y / bs);
     uint32_t ly  = static_cast<uint32_t>(y % bs);
 
-    for (const auto& c : sorted_block_list('y', y)) {
-        if (c.by_ != by_) continue;
+    auto blocks = sorted_block_list('y', y);
 
-        uint64_t x0 = static_cast<uint64_t>(c.bx) * bs;
-        uint64_t z0 = static_cast<uint64_t>(c.bz) * bs;
-        uint64_t nx_part = std::min(bs, dim_x_ - x0);
-        uint64_t nz_part = std::min(bs, dim_z_ - z0);
+    for_each_block_parallel(num_threads_, blocks,
+        [&](const BlockCoord& c) {
+            if (c.by_ != by_) return;
 
-        uint64_t boff = block_offset_float(c.bx, c.by_, c.bz);
+            uint64_t x0 = static_cast<uint64_t>(c.bx) * bs;
+            uint64_t z0 = static_cast<uint64_t>(c.bz) * bs;
+            uint64_t nx_part = std::min(bs, dim_x_ - x0);
+            uint64_t nz_part = std::min(bs, dim_z_ - z0);
 
-        for (uint32_t lx = 0; lx < nx_part; lx++) {
-            const float* src = dv + boff
-                + static_cast<uint64_t>(lx) * bs * bs
-                + static_cast<uint64_t>(ly) * bs;
-            float* dst = &result[(x0 + lx) * nz + z0];
-            for (uint64_t lz = 0; lz < nz_part; lz++) {
-                dst[lz] = src[lz];
+            uint64_t boff = block_offset_float(c.bx, c.by_, c.bz);
+
+            for (uint32_t lx = 0; lx < nx_part; lx++) {
+                const float* src = dv + boff
+                    + static_cast<uint64_t>(lx) * bs * bs
+                    + static_cast<uint64_t>(ly) * bs;
+                float* dst = &result[(x0 + lx) * nz + z0];
+                for (uint64_t lz = 0; lz < nz_part; lz++) {
+                    dst[lz] = src[lz];
+                }
             }
-        }
-    }
+        });
+
     return result;
 }
 
@@ -393,25 +432,29 @@ std::vector<float> BlockedFileReader::read_z_slice(uint64_t z) {
 
     uint64_t bs2 = bs * bs;
 
-    for (const auto& c : sorted_block_list('z', z)) {
-        if (c.bz != bz) continue;
+    auto blocks = sorted_block_list('z', z);
 
-        uint64_t x0 = static_cast<uint64_t>(c.bx) * bs;
-        uint64_t y0 = static_cast<uint64_t>(c.by_) * bs;
-        uint64_t nx_part = std::min(bs, dim_x_ - x0);
-        uint64_t ny_part = std::min(bs, dim_y_ - y0);
+    for_each_block_parallel(num_threads_, blocks,
+        [&](const BlockCoord& c) {
+            if (c.bz != bz) return;
 
-        uint64_t boff = block_offset_float(c.bx, c.by_, c.bz);
+            uint64_t x0 = static_cast<uint64_t>(c.bx) * bs;
+            uint64_t y0 = static_cast<uint64_t>(c.by_) * bs;
+            uint64_t nx_part = std::min(bs, dim_x_ - x0);
+            uint64_t ny_part = std::min(bs, dim_y_ - y0);
 
-        for (uint32_t lx = 0; lx < nx_part; lx++) {
-            const float* src_plane = dv + boff + static_cast<uint64_t>(lx) * bs2;
-            uint64_t x_row = (x0 + lx) * ny;
-            for (uint32_t ly = 0; ly < ny_part; ly++) {
-                result[x_row + (y0 + ly)] =
-                    src_plane[static_cast<uint64_t>(ly) * bs + lz];
+            uint64_t boff = block_offset_float(c.bx, c.by_, c.bz);
+
+            for (uint32_t lx = 0; lx < nx_part; lx++) {
+                const float* src_plane = dv + boff + static_cast<uint64_t>(lx) * bs2;
+                uint64_t x_row = (x0 + lx) * ny;
+                for (uint32_t ly = 0; ly < ny_part; ly++) {
+                    result[x_row + (y0 + ly)] =
+                        src_plane[static_cast<uint64_t>(ly) * bs + lz];
+                }
             }
-        }
-    }
+        });
+
     return result;
 }
 
@@ -431,36 +474,14 @@ BlockedFileReader::read_slice(char axis, uint64_t index) {
 std::vector<std::vector<float>>
 BlockedFileReader::read_slices_batch(char axis,
                                      const std::vector<uint64_t>& indices,
-                                     int num_threads) {
-    int nt = num_threads > 0 ? num_threads : num_threads_;
+                                     int /*num_threads*/) {
+    // Each read_slice call parallelises block processing internally via
+    // num_threads_.  Process slices sequentially to avoid oversubscription.
     size_t n = indices.size();
     std::vector<std::vector<float>> results(n);
-
-    if (nt <= 1 || n <= 1) {
-        for (size_t i = 0; i < n; i++) {
-            results[i] = read_slice(axis, indices[i]);
-        }
-        return results;
+    for (size_t i = 0; i < n; i++) {
+        results[i] = read_slice(axis, indices[i]);
     }
-
-    size_t num_workers = static_cast<size_t>(nt);
-    if (num_workers > n) num_workers = n;
-
-    std::vector<std::thread> threads;
-    threads.reserve(num_workers);
-
-    for (size_t w = 0; w < num_workers; w++) {
-        threads.emplace_back([this, axis, &indices, &results, n, num_workers, w]() {
-            for (size_t i = w; i < n; i += num_workers) {
-                results[i] = read_slice(axis, indices[i]);
-            }
-        });
-    }
-
-    for (auto& t : threads) {
-        t.join();
-    }
-
     return results;
 }
 

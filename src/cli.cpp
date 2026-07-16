@@ -14,7 +14,8 @@ using namespace block3d;
 static void print_usage(const char* prog) {
     std::cerr << "Usage:\n";
     std::cerr << "  " << prog << " convert <input> <output> --dim-x N --dim-y N --dim-z N\n";
-    std::cerr << "         [--block-size N] [--threads N] [--memory-limit N] [--no-progress]\n";
+    std::cerr << "         [--block-size N]  (16–256; 0 or omit = auto-detect via storage probe)\n";
+    std::cerr << "         [--threads N] [--memory-limit N] [--no-progress]\n";
     std::cerr << "  " << prog << " info <file>\n";
     std::cerr << "  " << prog << " bench <file> [--num-reads N] [--random] [--threads N] [--memory-limit N] [--warm-up]\n";
     std::cerr << "  " << prog << " verify <b3d> <raw> [--samples N]\n";
@@ -58,10 +59,29 @@ static int cmd_convert(int argc, char* argv[]) {
     if (dx == 0 || dy == 0 || dz == 0) {
         std::cerr << "Must specify --dim-x, --dim-y, --dim-z\n"; return 1;
     }
-    uint64_t bs = get_arg_uint64(argc, argv, "--block-size", 32);
+    uint64_t bs = get_arg_uint64(argc, argv, "--block-size", 0);
     int nt = get_arg_int(argc, argv, "--threads", 0);
     uint64_t mem_mb = get_arg_uint64(argc, argv, "--memory-limit", 0);
     bool prog = !has_arg(argc, argv, "--no-progress");
+
+    // Auto-detect storage medium and pick optimal block_size.
+    if (bs == 0) {
+        std::string out_str(output);
+        auto slash = out_str.find_last_of("/\\");
+        std::string parent =
+            (slash != std::string::npos) ? out_str.substr(0, slash) : ".";
+        auto sc = detect_storage_medium(parent);
+        bs = auto_block_size(dx, dy, dz, sc);
+        const char* sc_names[] = {"HDD", "SSD", "NVMe", "Unknown"};
+        std::cout << "[AUTO] Detected "
+                  << sc_names[static_cast<int>(sc)]
+                  << " storage, auto block_size=" << bs << "\n";
+    }
+    if (bs < 16 || bs > 256) {
+        std::cerr << "Invalid block_size: " << bs
+                  << " (must be 16–256, or 0 for auto)\n";
+        return 1;
+    }
 
     std::cout << "Converting: " << input << " -> " << output << "\n";
     std::cout << "  dims=" << dx << "x" << dy << "x" << dz

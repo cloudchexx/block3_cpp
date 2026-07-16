@@ -152,7 +152,8 @@ static std::map<std::string, DatasetInfo> DATASETS = {
 // ── Helpers ──────────────────────────────────────────────────────────
 
 static bool is_valid_b3d(const std::string& path,
-                          uint64_t dx, uint64_t dy, uint64_t dz) {
+                          uint64_t dx, uint64_t dy, uint64_t dz,
+                          uint64_t bs = 0) {
     if (!fs::exists(path)) return false;
     std::ifstream f(path, std::ios::binary);
     if (!f) return false;
@@ -161,7 +162,8 @@ static bool is_valid_b3d(const std::string& path,
     if (f.gcount() != sizeof(FileHeader)) return false;
     return std::memcmp(hdr.magic, MAGIC, 4) == 0 &&
            hdr.version == VERSION &&
-           hdr.dim_x == dx && hdr.dim_y == dy && hdr.dim_z == dz;
+           hdr.dim_x == dx && hdr.dim_y == dy && hdr.dim_z == dz &&
+           (bs == 0 || hdr.block_size == bs);
 }
 
 static std::string size_str(uint64_t bytes) {
@@ -432,8 +434,21 @@ static int run_full_test(const std::string& ds_name,
         return 1;
     }
 
+    // Auto-detect block_size when not explicitly set.
+    if (block_size == 0) {
+        auto slash = b3d_path.find_last_of("/\\");
+        std::string parent =
+            (slash != std::string::npos) ? b3d_path.substr(0, slash) : ".";
+        auto sc = detect_storage_medium(parent);
+        block_size = auto_block_size(cfg.dim_x, cfg.dim_y, cfg.dim_z, sc);
+        const char* sc_names[] = {"HDD", "SSD", "NVMe", "Unknown"};
+        std::cout << "[AUTO-BS] Detected "
+                  << sc_names[static_cast<int>(sc)]
+                  << " storage, auto block_size=" << block_size << "\n";
+    }
+
     // 1. Convert (skip if valid)
-    if (is_valid_b3d(b3d_path, cfg.dim_x, cfg.dim_y, cfg.dim_z)) {
+    if (is_valid_b3d(b3d_path, cfg.dim_x, cfg.dim_y, cfg.dim_z, block_size)) {
         auto sz = fs::file_size(b3d_path);
         std::cout << "[SKIP] " << ds_name << ": '" << b3d_path
                   << "' already exists (" << size_str(sz)
@@ -686,7 +701,7 @@ static int run_full_test(const std::string& ds_name,
 
 int main(int argc, char* argv[]) {
     std::vector<std::string> datasets;
-    uint64_t block_size = 32;
+    uint64_t block_size = 0;   // 0 = auto-detect via storage probe
     int random_count = 100;
     int seq_count = 10;
     int verify_samples = 20000;
@@ -747,8 +762,9 @@ int main(int argc, char* argv[]) {
     if (datasets.empty()) datasets = {"test18", "test50"};
 
     // ── Strict parameter validation (fail fast, non-zero) ────────────
-    if (block_size == 0) {
-        std::cerr << "[ERROR] --block-size must be > 0\n";
+    // block_size == 0 means auto-detect; resolved per-dataset in run_full_test.
+    if (block_size > 256) {
+        std::cerr << "[ERROR] --block-size must be 0–256 (0=auto)\n";
         return 2;
     }
     if (random_count <= 0) {

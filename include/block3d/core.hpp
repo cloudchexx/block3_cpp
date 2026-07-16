@@ -2,9 +2,24 @@
 #include <cstdint>
 #include <tuple>
 #include <vector>
+#include <string>
 #include "types.hpp"
 
 namespace block3d {
+
+// ── Storage medium classification ─────────────────────────────────────
+
+enum class StorageClass { HDD, SSD, NVMe, Unknown };
+
+/// Quick write+fsync test to classify the storage underlying `output_dir`.
+/// Creates and removes a small temp file; returns Unknown on failure.
+StorageClass detect_storage_medium(const std::string& output_dir);
+
+/// Heuristically choose a block_size that balances X/Y/Z slice performance
+/// for the given volume dimensions and storage medium.
+/// Returns a value in [16, 256] that is a multiple of 4.
+uint64_t auto_block_size(uint64_t dim_x, uint64_t dim_y, uint64_t dim_z,
+                         StorageClass medium);
 
 inline uint32_t spread_bits(uint32_t v) {
     v = (v | (v << 16)) & 0x030000FF;

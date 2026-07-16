@@ -6,6 +6,8 @@
 
 实现 `BlockLayout3D::block_order()`：枚举所有逻辑块，计算 Morton code，排序后返回 `(bx, by, bz)`。转换器使用该结果决定物理写入顺序。
 
+实现 `detect_storage_medium()` 和 `auto_block_size()`。存储探测执行 5 轮 1MiB 写入+fsync，取中位延迟；块大小选择在最差轴切片触及的目标块数约束下扫描 16–256（步长 8）。
+
 ### `converter.cpp`
 
 - `extract_block()`：从无头 X-Y-Z 原始 mmap 中提取固定块；完整块逐行 `memcpy`，边界块补零。
@@ -23,6 +25,8 @@ MappedFile(raw)
 ```
 
 块提取可并行，文件写入串行。`max_memory_mb` 只参与批次大小计算。
+
+CLI 层（`cli.cpp` 和 `run_test.cpp`）在未显式指定 `--block-size` 时默认调用 `detect_storage_medium()` + `auto_block_size()`，根据实际硬件自适应选择块大小。
 
 ### `reader.cpp`
 
@@ -43,12 +47,15 @@ read_*_slice()
  -> sorted_block_list(axis, index)
  -> logical block offset lookup
  -> sort by physical offset
- -> copy block fragments into contiguous result
+ -> for_each_block_parallel(): split blocks across num_threads
+    threads (when block_count > num_threads × 4)
+ -> each thread copies its block fragments into non-overlapping
+    result regions (no locks needed)
 ```
 
 其他路径：
 
-- `read_slices_batch()`：round-robin 请求级多线程。
+- `read_slices_batch()`：顺序派发到 `read_slice()`（每次调用已在内部并行化块处理）。
 - `read_*_column()`：X/Y 跨步读取，Z 使用连续段复制。
 - `read_subvolume()`：遍历相交块并复制连续 Z 段；区间为半开区间。
 - `read_full_volume()`：完整范围的 `read_subvolume()`。
