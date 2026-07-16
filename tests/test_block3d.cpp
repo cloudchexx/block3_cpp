@@ -1,0 +1,721 @@
+#include "block3d/core.hpp"
+#include "block3d/reader.hpp"
+#include "block3d/converter.hpp"
+#include "block3d/rng.hpp"
+#include <iostream>
+#include <fstream>
+#include <filesystem>
+#include <cstdlib>
+#include <cmath>
+#include <cstring>
+#include <vector>
+#include <random>
+#include <thread>
+#include <atomic>
+
+namespace fs = std::filesystem;
+
+using namespace block3d;
+
+static bool allclose(const std::vector<float>& a,
+                     const std::vector<float>& b,
+                     float rtol = 1e-5f, float atol = 1e-6f) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); i++) {
+        float diff = std::abs(a[i] - b[i]);
+        float max_abs = std::max(std::abs(a[i]), std::abs(b[i]));
+        if (diff > atol && diff > rtol * max_abs) return false;
+    }
+    return true;
+}
+
+static int test_morton() {
+    std::cout << "  Morton encode/decode roundtrip...";
+    for (uint32_t bx = 0; bx < 64; bx++) {
+        for (uint32_t by_ = 0; by_ < 64; by_++) {
+            for (uint32_t bz = 0; bz < 64; bz++) {
+                uint32_t code = morton_encode(bx, by_, bz);
+                auto [rbx, rby, rbz] = morton_decode(code);
+                if (bx != rbx || by_ != rby || bz != rbz) {
+                    std::cerr << "FAIL at (" << bx << "," << by_ << "," << bz
+                              << ") -> (" << rbx << "," << rby << "," << rbz << ")\n";
+                    return 1;
+                }
+            }
+        }
+    }
+    std::cout << "PASS\n";
+    return 0;
+}
+
+static int test_block_layout() {
+    std::cout << "  BlockLayout3D basic...";
+    BlockLayout3D layout(100, 200, 300, 32);
+    if (layout.blocks_x != 4 || layout.blocks_y != 7 || layout.blocks_z != 10) {
+        std::cerr << "FAIL: unexpected block counts\n";
+        return 1;
+    }
+    if (layout.total_blocks != 280) {
+        std::cerr << "FAIL: total_blocks=" << layout.total_blocks << "\n";
+        return 1;
+    }
+    std::cout << "PASS\n";
+    return 0;
+}
+
+static int test_block_order() {
+    std::cout << "  BlockLayout3D block_order...";
+    BlockLayout3D layout(100, 200, 300, 32);
+    auto order = layout.block_order();
+    if (order.size() != layout.total_blocks) {
+        std::cerr << "FAIL: size mismatch " << order.size()
+                  << " vs " << layout.total_blocks << "\n";
+        return 1;
+    }
+    bool sorted = true;
+    for (size_t i = 1; i < order.size(); i++) {
+        auto [ax, ay, az] = order[i - 1];
+        auto [bx, by_, bz] = order[i];
+        if (morton_encode(ax, ay, az) >= morton_encode(bx, by_, bz)) {
+            sorted = false;
+            break;
+        }
+    }
+    if (!sorted) {
+        std::cerr << "FAIL: not sorted by Morton order\n";
+        return 1;
+    }
+    std::cout << "PASS\n";
+    return 0;
+}
+
+static int test_roundtrip() {
+    std::cout << "  Full roundtrip (convert + read)...";
+
+    uint64_t dx = 16, dy = 20, dz = 24;
+    uint64_t total = dx * dy * dz;
+    std::vector<float> raw_data(total);
+
+    XorShift32 rng(42);
+    for (size_t i = 0; i < total; i++)
+        raw_data[i] = rng.next_float();
+
+    fs::path tmp = fs::temp_directory_path() / "block3d_test";
+    fs::create_directories(tmp);
+    fs::path raw_path = tmp / "test_raw.dat";
+    fs::path b3d_path = tmp / "test.b3d";
+
+    {
+        std::ofstream f(raw_path, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(raw_data.data()),
+                raw_data.size() * sizeof(float));
+    }
+
+    convert_raw_to_blocked(raw_path.string(), b3d_path.string(),
+                           dx, dy, dz, 8, 2, false);
+
+    BlockedFileReader reader(b3d_path.string());
+    auto result = reader.read_full_volume();
+
+    for (size_t i = 0; i < total; i++) {
+        float diff = std::abs(result[i] - raw_data[i]);
+        float max_abs = std::max(std::abs(result[i]), std::abs(raw_data[i]));
+        if (diff > 1e-6f && diff > 1e-5f * max_abs) {
+            std::cerr << "FAIL at index " << i << ": " << result[i]
+                      << " vs " << raw_data[i] << "\n";
+            return 1;
+        }
+    }
+    std::cout << "PASS\n";
+    return 0;
+}
+
+static int test_slice_reads() {
+    std::cout << "  Slice reads...";
+
+    uint64_t dx = 16, dy = 20, dz = 24;
+    uint64_t total = dx * dy * dz;
+    std::vector<float> raw_data(total);
+    XorShift32 rng(42);
+    for (size_t i = 0; i < total; i++)
+        raw_data[i] = rng.next_float();
+
+    auto at = [&](uint64_t x, uint64_t y, uint64_t z) -> float {
+        return raw_data[x * dy * dz + y * dz + z];
+    };
+
+    fs::path tmp = fs::temp_directory_path() / "block3d_test";
+    fs::path raw_path = tmp / "test_slice_raw.dat";
+    fs::path b3d_path = tmp / "test_slice.b3d";
+
+    {
+        std::ofstream f(raw_path, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(raw_data.data()),
+                raw_data.size() * sizeof(float));
+    }
+
+    convert_raw_to_blocked(raw_path.string(), b3d_path.string(),
+                           dx, dy, dz, 8, 2, false);
+
+    BlockedFileReader reader(b3d_path.string());
+
+    {
+        auto slice = reader.read_x_slice(dx / 2);
+        if (slice.size() != dy * dz) {
+            std::cerr << "FAIL X-slice size\n"; return 1;
+        }
+        for (uint64_t y = 0; y < dy; y++)
+            for (uint64_t z = 0; z < dz; z++)
+                if (std::abs(slice[y * dz + z] - at(dx / 2, y, z)) > 1e-6f) {
+                    std::cerr << "FAIL X-slice at (" << y << "," << z << ")\n";
+                    return 1;
+                }
+    }
+
+    {
+        auto slice = reader.read_y_slice(dy / 2);
+        if (slice.size() != dx * dz) {
+            std::cerr << "FAIL Y-slice size\n"; return 1;
+        }
+        for (uint64_t x = 0; x < dx; x++)
+            for (uint64_t z = 0; z < dz; z++)
+                if (std::abs(slice[x * dz + z] - at(x, dy / 2, z)) > 1e-6f) {
+                    std::cerr << "FAIL Y-slice at (" << x << "," << z << ")\n";
+                    return 1;
+                }
+    }
+
+    {
+        auto slice = reader.read_z_slice(dz / 2);
+        if (slice.size() != dx * dy) {
+            std::cerr << "FAIL Z-slice size\n"; return 1;
+        }
+        for (uint64_t x = 0; x < dx; x++)
+            for (uint64_t y = 0; y < dy; y++)
+                if (std::abs(slice[x * dy + y] - at(x, y, dz / 2)) > 1e-6f) {
+                    std::cerr << "FAIL Z-slice at (" << x << "," << y << ")\n";
+                    return 1;
+                }
+    }
+
+    std::cout << "PASS\n";
+    return 0;
+}
+
+static int test_column_reads() {
+    std::cout << "  Column reads...";
+
+    uint64_t dx = 16, dy = 20, dz = 24;
+    uint64_t total = dx * dy * dz;
+    std::vector<float> raw_data(total);
+    XorShift32 rng(42);
+    for (size_t i = 0; i < total; i++)
+        raw_data[i] = rng.next_float();
+
+    auto at = [&](uint64_t x, uint64_t y, uint64_t z) -> float {
+        return raw_data[x * dy * dz + y * dz + z];
+    };
+
+    fs::path tmp = fs::temp_directory_path() / "block3d_test";
+    fs::path raw_path = tmp / "test_col_raw.dat";
+    fs::path b3d_path = tmp / "test_col.b3d";
+
+    {
+        std::ofstream f(raw_path, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(raw_data.data()),
+                raw_data.size() * sizeof(float));
+    }
+
+    convert_raw_to_blocked(raw_path.string(), b3d_path.string(),
+                           dx, dy, dz, 8, 2, false);
+
+    BlockedFileReader reader(b3d_path.string());
+
+    {
+        auto col = reader.read_x_column(dy / 3, dz / 3);
+        if (col.size() != dx) { std::cerr << "FAIL X-col size\n"; return 1; }
+        for (uint64_t x = 0; x < dx; x++)
+            if (std::abs(col[x] - at(x, dy / 3, dz / 3)) > 1e-6f) {
+                std::cerr << "FAIL X-col at " << x << "\n"; return 1;
+            }
+    }
+
+    {
+        auto col = reader.read_y_column(dx / 3, dz / 3);
+        if (col.size() != dy) { std::cerr << "FAIL Y-col size\n"; return 1; }
+        for (uint64_t y = 0; y < dy; y++)
+            if (std::abs(col[y] - at(dx / 3, y, dz / 3)) > 1e-6f) {
+                std::cerr << "FAIL Y-col at " << y << "\n"; return 1;
+            }
+    }
+
+    {
+        auto col = reader.read_z_column(dx / 3, dy / 3);
+        if (col.size() != dz) { std::cerr << "FAIL Z-col size\n"; return 1; }
+        for (uint64_t z = 0; z < dz; z++)
+            if (std::abs(col[z] - at(dx / 3, dy / 3, z)) > 1e-6f) {
+                std::cerr << "FAIL Z-col at " << z << "\n"; return 1;
+            }
+    }
+
+    std::cout << "PASS\n";
+    return 0;
+}
+
+static int test_subvolume() {
+    std::cout << "  Subvolume read...";
+
+    uint64_t dx = 16, dy = 20, dz = 24;
+    uint64_t total = dx * dy * dz;
+    std::vector<float> raw_data(total);
+    XorShift32 rng(42);
+    for (size_t i = 0; i < total; i++)
+        raw_data[i] = rng.next_float();
+
+    auto at = [&](uint64_t x, uint64_t y, uint64_t z) -> float {
+        return raw_data[x * dy * dz + y * dz + z];
+    };
+
+    fs::path tmp = fs::temp_directory_path() / "block3d_test";
+    fs::path raw_path = tmp / "test_subv_raw.dat";
+    fs::path b3d_path = tmp / "test_subv.b3d";
+
+    {
+        std::ofstream f(raw_path, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(raw_data.data()),
+                raw_data.size() * sizeof(float));
+    }
+
+    convert_raw_to_blocked(raw_path.string(), b3d_path.string(),
+                           dx, dy, dz, 8, 2, false);
+
+    BlockedFileReader reader(b3d_path.string());
+
+    auto sub = reader.read_subvolume(2, 14, 3, 17, 5, 20);
+
+    uint64_t nx = 12, ny = 14, nz = 15;
+    if (sub.size() != nx * ny * nz) {
+        std::cerr << "FAIL subvolume size\n"; return 1;
+    }
+
+    for (uint64_t x = 2; x < 14; x++)
+        for (uint64_t y = 3; y < 17; y++)
+            for (uint64_t z = 5; z < 20; z++) {
+                uint64_t idx = (x-2) * ny * nz + (y-3) * nz + (z-5);
+                if (std::abs(sub[idx] - at(x, y, z)) > 1e-6f) {
+                    std::cerr << "FAIL subvolume at (" << x << "," << y
+                              << "," << z << ")\n";
+                    return 1;
+                }
+            }
+
+    std::cout << "PASS\n";
+    return 0;
+}
+
+static int test_storage_ratio() {
+    std::cout << "  Storage ratio < 1.5x...";
+
+    uint64_t dx = 16, dy = 20, dz = 24;
+    uint64_t total = dx * dy * dz;
+    std::vector<float> raw_data(total, 1.0f);
+
+    fs::path tmp = fs::temp_directory_path() / "block3d_test";
+    fs::path raw_path = tmp / "test_ratio_raw.dat";
+    fs::path b3d_path = tmp / "test_ratio.b3d";
+
+    {
+        std::ofstream f(raw_path, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(raw_data.data()),
+                raw_data.size() * sizeof(float));
+    }
+
+    convert_raw_to_blocked(raw_path.string(), b3d_path.string(),
+                           dx, dy, dz, 8, 2, false);
+
+    double raw_size = static_cast<double>(fs::file_size(raw_path));
+    double b3d_size = static_cast<double>(fs::file_size(b3d_path));
+    double ratio = b3d_size / raw_size;
+
+    if (ratio >= 1.5) {
+        std::cerr << "FAIL: ratio=" << ratio << "\n"; return 1;
+    }
+    std::cout << "PASS (ratio=" << ratio << ")\n";
+    return 0;
+}
+
+static int test_verify() {
+    std::cout << "  Verify against raw...";
+
+    uint64_t dx = 16, dy = 20, dz = 24;
+    uint64_t total = dx * dy * dz;
+    std::vector<float> raw_data(total);
+    XorShift32 rng(42);
+    for (size_t i = 0; i < total; i++)
+        raw_data[i] = rng.next_float();
+
+    fs::path tmp = fs::temp_directory_path() / "block3d_test";
+    fs::path raw_path = tmp / "test_verify_raw.dat";
+    fs::path b3d_path = tmp / "test_verify.b3d";
+
+    {
+        std::ofstream f(raw_path, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(raw_data.data()),
+                raw_data.size() * sizeof(float));
+    }
+
+    convert_raw_to_blocked(raw_path.string(), b3d_path.string(),
+                           dx, dy, dz, 8, 2, false);
+
+    BlockedFileReader reader(b3d_path.string());
+    if (!reader.verify(raw_path.string(), 500)) {
+        std::cerr << "FAIL: verification returned false\n"; return 1;
+    }
+    std::cout << "PASS\n";
+    return 0;
+}
+
+static int test_batch_read() {
+    std::cout << "  Batch slice read (thread safety)...";
+
+    uint64_t dx = 32, dy = 32, dz = 32;
+    uint64_t total = dx * dy * dz;
+    std::vector<float> raw_data(total, 1.0f);
+
+    fs::path tmp = fs::temp_directory_path() / "block3d_test";
+    fs::path raw_path = tmp / "test_batch_raw.dat";
+    fs::path b3d_path = tmp / "test_batch.b3d";
+
+    {
+        std::ofstream f(raw_path, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(raw_data.data()),
+                raw_data.size() * sizeof(float));
+    }
+
+    convert_raw_to_blocked(raw_path.string(), b3d_path.string(),
+                           dx, dy, dz, 8, 4, false);
+
+    BlockedFileReader reader(b3d_path.string());
+    std::vector<uint64_t> indices = {0, 5, 10, 15, 20, 25, 30};
+
+    for (char axis : {'x', 'y', 'z'}) {
+        auto slices = reader.read_slices_batch(axis, indices, 4);
+        if (slices.size() != indices.size()) {
+            std::cerr << "FAIL batch count for " << axis << "\n"; return 1;
+        }
+    }
+
+    std::cout << "PASS\n";
+    return 0;
+}
+
+// Regression test for the 0xC0000005 crash in read_slices_batch over
+// contiguous adjacent indices on the same axis that map to the SAME
+// (axis, block_key). The original sorted_block_list returned a const& into
+// the cache_ unordered_map after releasing cache_mutex_; concurrent threads
+// on the same block_key entered the slow path together and one would
+// overwrite the vector another was iterating -> use-after-free. With by-value
+// return this must be stable and correct under heavy contention.
+static int test_concurrent_adjacent_same_block_key() {
+    std::cout << "  Concurrent adjacent same-axis same-block-key batch...";
+
+    // block_size=8 -> a contiguous run of 8 indices shares one block_key.
+    uint64_t bs = 8;
+    uint64_t dx = 64, dy = 48, dz = 40;
+    uint64_t total = dx * dy * dz;
+    std::vector<float> raw_data(total);
+    XorShift32 rng(7);
+    for (size_t i = 0; i < total; i++) raw_data[i] = rng.next_float();
+
+    auto at = [&](uint64_t x, uint64_t y, uint64_t z) -> float {
+        return raw_data[x * dy * dz + y * dz + z];
+    };
+
+    fs::path tmp = fs::temp_directory_path() / "block3d_test";
+    fs::path raw_path = tmp / "test_conc_adj_raw.dat";
+    fs::path b3d_path = tmp / "test_conc_adj.b3d";
+
+    {
+        std::ofstream f(raw_path, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(raw_data.data()),
+                raw_data.size() * sizeof(float));
+    }
+    convert_raw_to_blocked(raw_path.string(), b3d_path.string(),
+                           dx, dy, dz, bs, 2, false);
+
+    BlockedFileReader reader(b3d_path.string());
+
+    // Contiguous run within a single block (all map to block_key 0).
+    std::vector<uint64_t> same_key_indices;
+    for (uint64_t i = 0; i < bs; i++) same_key_indices.push_back(i);
+
+    int hw = static_cast<int>(std::thread::hardware_concurrency());
+    if (hw < 16) hw = 16;  // over-subscribe to widen the race window
+
+    const int iterations = 40;
+    for (int iter = 0; iter < iterations; iter++) {
+        for (char axis : {'x', 'y', 'z'}) {
+            // Same-key batch: thread count == batch size forces every thread
+            // into the sorted_block_list slow path for one (axis, block_key)
+            // simultaneously -- the exact crash scenario.
+            auto sk = reader.read_slices_batch(
+                axis, same_key_indices, static_cast<int>(same_key_indices.size()));
+            if (sk.size() != same_key_indices.size()) {
+                std::cerr << "FAIL same-key count axis " << axis << "\n"; return 1;
+            }
+
+            // Multi-key contiguous batch: many distinct block_keys with a
+            // high thread count, stressing rehash of cache_ and LRU prune
+            // while other threads iterate their own (by-value) copies.
+            uint64_t dim = (axis == 'x') ? dx : (axis == 'y') ? dy : dz;
+            std::vector<uint64_t> mk_idx;
+            for (uint64_t i = 0; i < dim; i++) mk_idx.push_back(i);
+            auto mk = reader.read_slices_batch(axis, mk_idx, hw);
+            if (mk.size() != mk_idx.size()) {
+                std::cerr << "FAIL multi-key count axis " << axis << "\n"; return 1;
+            }
+
+            // Correctness check on the same-key batch (deterministic).
+            for (size_t i = 0; i < same_key_indices.size(); i++) {
+                uint64_t idx = same_key_indices[i];
+                const auto& sl = sk[i];
+                if (axis == 'x') {
+                    if (sl.size() != dy * dz) { std::cerr << "FAIL x slice size\n"; return 1; }
+                    for (uint64_t y = 0; y < dy; y++)
+                        for (uint64_t z = 0; z < dz; z++)
+                            if (std::abs(sl[y * dz + z] - at(idx, y, z)) > 1e-6f) {
+                                std::cerr << "FAIL x slice val idx=" << idx << "\n"; return 1;
+                            }
+                } else if (axis == 'y') {
+                    if (sl.size() != dx * dz) { std::cerr << "FAIL y slice size\n"; return 1; }
+                    for (uint64_t x = 0; x < dx; x++)
+                        for (uint64_t z = 0; z < dz; z++)
+                            if (std::abs(sl[x * dz + z] - at(x, idx, z)) > 1e-6f) {
+                                std::cerr << "FAIL y slice val idx=" << idx << "\n"; return 1;
+                            }
+                } else {
+                    if (sl.size() != dx * dy) { std::cerr << "FAIL z slice size\n"; return 1; }
+                    for (uint64_t x = 0; x < dx; x++)
+                        for (uint64_t y = 0; y < dy; y++)
+                            if (std::abs(sl[x * dy + y] - at(x, y, idx)) > 1e-6f) {
+                                std::cerr << "FAIL z slice val idx=" << idx << "\n"; return 1;
+                            }
+                }
+            }
+        }
+    }
+
+    // Mixed-axis hammer: many threads, all axes, one shared reader/cache.
+    // Maximizes cross-key rehash + LRU churn + same-key slow-path races on
+    // the single cache_mutex_, with correctness spot-checks.
+    {
+        int nthreads = hw;
+        std::vector<std::thread> ths;
+        ths.reserve(nthreads);
+        std::atomic<long long> errs{0};
+        for (int t = 0; t < nthreads; t++) {
+            ths.emplace_back([&, t]() {
+                XorShift32 lrng(1000 + t);
+                for (int it = 0; it < 300; it++) {
+                    char axis = "xyz"[lrng.rand_u64_mod(3)];
+                    uint64_t dim = (axis == 'x') ? dx : (axis == 'y') ? dy : dz;
+                    uint64_t idx = lrng.rand_u64_mod(dim);
+                    auto sl = reader.read_slice(axis, idx);
+                    uint64_t exp = (axis == 'x') ? dy * dz
+                                 : (axis == 'y') ? dx * dz : dx * dy;
+                    if (sl.size() != exp) { errs.fetch_add(1); continue; }
+                    uint64_t y = lrng.rand_u64_mod(dy);
+                    uint64_t z = lrng.rand_u64_mod(dz);
+                    uint64_t x = lrng.rand_u64_mod(dx);
+                    float got = 0.0f, want = 0.0f;
+                    if (axis == 'x')      { got = sl[y * dz + z]; want = at(idx, y, z); }
+                    else if (axis == 'y') { got = sl[x * dz + z]; want = at(x, idx, z); }
+                    else                  { got = sl[x * dy + y]; want = at(x, y, idx); }
+                    if (std::abs(got - want) > 1e-6f) errs.fetch_add(1);
+                }
+            });
+        }
+        for (auto& th : ths) th.join();
+        if (errs.load() != 0) {
+            std::cerr << "FAIL mixed-axis hammer: " << errs.load() << " errors\n";
+            return 1;
+        }
+    }
+
+    std::cout << "PASS\n";
+    return 0;
+}
+
+static int test_batch_column_read() {
+    std::cout << "  Batch column read...";
+
+    uint64_t dx = 32, dy = 24, dz = 20;
+    uint64_t total = dx * dy * dz;
+    std::vector<float> raw_data(total);
+    XorShift32 rng(12345);
+    for (size_t i = 0; i < total; i++)
+        raw_data[i] = rng.next_float();
+
+    auto at = [&](uint64_t x, uint64_t y, uint64_t z) -> float {
+        return raw_data[x * dy * dz + y * dz + z];
+    };
+
+    fs::path tmp = fs::temp_directory_path() / "block3d_test";
+    fs::path raw_path = tmp / "test_batchcol_raw.dat";
+    fs::path b3d_path = tmp / "test_batchcol.b3d";
+
+    {
+        std::ofstream f(raw_path, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(raw_data.data()),
+                raw_data.size() * sizeof(float));
+    }
+
+    convert_raw_to_blocked(raw_path.string(), b3d_path.string(),
+                           dx, dy, dz, 8, 4, false);
+
+    BlockedFileReader reader(b3d_path.string());
+
+    std::vector<std::pair<uint64_t, uint64_t>> coords = {
+        {2, 3}, {10, 15}, {20, 5}, {dy/3, dz/3}
+    };
+
+    {
+        auto cols = reader.read_x_columns_batch(coords, 2);
+        if (cols.size() != coords.size()) {
+            std::cerr << "FAIL X batch column count\n"; return 1;
+        }
+        for (size_t c = 0; c < coords.size(); c++) {
+            auto [y, z] = coords[c];
+            if (cols[c].size() != dx) {
+                std::cerr << "FAIL X batch col size at " << c << "\n"; return 1;
+            }
+            for (uint64_t x = 0; x < dx; x++)
+                if (std::abs(cols[c][x] - at(x, y, z)) > 1e-6f) {
+                    std::cerr << "FAIL X batch col at (" << x << "," << y
+                              << "," << z << ")\n";
+                    return 1;
+                }
+        }
+    }
+
+    {
+        auto cols = reader.read_y_columns_batch(coords, 2);
+        if (cols.size() != coords.size()) {
+            std::cerr << "FAIL Y batch column count\n"; return 1;
+        }
+        for (size_t c = 0; c < coords.size(); c++) {
+            auto [x, z] = coords[c];
+            if (cols[c].size() != dy) {
+                std::cerr << "FAIL Y batch col size at " << c << "\n"; return 1;
+            }
+            for (uint64_t y = 0; y < dy; y++)
+                if (std::abs(cols[c][y] - at(x, y, z)) > 1e-6f) {
+                    std::cerr << "FAIL Y batch col at (" << x << "," << y
+                              << "," << z << ")\n";
+                    return 1;
+                }
+        }
+    }
+
+    {
+        auto cols = reader.read_z_columns_batch(coords, 2);
+        if (cols.size() != coords.size()) {
+            std::cerr << "FAIL Z batch column count\n"; return 1;
+        }
+        for (size_t c = 0; c < coords.size(); c++) {
+            auto [x, y] = coords[c];
+            if (cols[c].size() != dz) {
+                std::cerr << "FAIL Z batch col size at " << c << "\n"; return 1;
+            }
+            for (uint64_t z = 0; z < dz; z++)
+                if (std::abs(cols[c][z] - at(x, y, z)) > 1e-6f) {
+                    std::cerr << "FAIL Z batch col at (" << x << "," << y
+                              << "," << z << ")\n";
+                    return 1;
+                }
+        }
+    }
+
+    std::cout << "PASS\n";
+    return 0;
+}
+
+static int test_memory_budget() {
+    std::cout << "  Memory budget parameter...";
+
+    uint64_t dx = 32, dy = 32, dz = 32;
+    uint64_t total = dx * dy * dz;
+    std::vector<float> raw_data(total);
+    XorShift32 rng(99);
+    for (size_t i = 0; i < total; i++)
+        raw_data[i] = rng.next_float();
+
+    fs::path tmp = fs::temp_directory_path() / "block3d_test";
+    fs::path raw_path = tmp / "test_membudget_raw.dat";
+    fs::path b3d_path = tmp / "test_membudget.b3d";
+
+    {
+        std::ofstream f(raw_path, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(raw_data.data()),
+                raw_data.size() * sizeof(float));
+    }
+
+    convert_raw_to_blocked(raw_path.string(), b3d_path.string(),
+                           dx, dy, dz, 8, 2, false, 1);
+
+    BlockedFileReader reader(b3d_path.string(), 0, 10);
+    if (reader.max_memory_mb() != 10) {
+        std::cerr << "FAIL: max_memory_mb not set\n"; return 1;
+    }
+
+    auto full = reader.read_full_volume();
+    if (full.size() != total) {
+        std::cerr << "FAIL: full volume size mismatch\n"; return 1;
+    }
+
+    for (size_t i = 0; i < total; i++)
+        if (std::abs(full[i] - raw_data[i]) > 1e-6f) {
+            std::cerr << "FAIL at index " << i << "\n"; return 1;
+        }
+
+    std::cout << "PASS\n";
+    return 0;
+}
+
+int main() {
+    std::cout << "block3d C++ tests\n";
+    std::cout << "=================\n";
+
+    fs::path tmp = fs::temp_directory_path() / "block3d_test";
+    fs::create_directories(tmp);
+
+    int failed = 0;
+
+    auto run = [&](const char* name, auto fn) {
+        std::cout << name << "\n";
+        if (fn() != 0) failed++;
+    };
+
+    run("Core:", []() {
+        return test_morton() | test_block_layout() | test_block_order();
+    });
+
+    run("IO:", []() {
+        return test_roundtrip() | test_slice_reads()
+             | test_column_reads() | test_subvolume()
+             | test_storage_ratio() | test_verify()
+             | test_batch_read() | test_concurrent_adjacent_same_block_key()
+             | test_batch_column_read()
+             | test_memory_budget();
+    });
+
+    fs::remove_all(tmp);
+
+    std::cout << "=================\n";
+    if (failed > 0) {
+        std::cout << failed << " test group(s) FAILED!\n";
+        return 1;
+    }
+    std::cout << "All tests PASSED\n";
+    return 0;
+}

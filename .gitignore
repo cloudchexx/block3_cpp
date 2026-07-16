@@ -1,0 +1,26 @@
+# Build output
+build/
+
+# Large data files
+*.dat
+*.b3d
+
+# Logs
+logs/
+
+# Python
+generator_py/__pycache__/
+*.pyc
+__pycache__/
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db

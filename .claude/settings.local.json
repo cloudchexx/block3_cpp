@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python *)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:api.github.com)",
+      "Skill(jujutsu)",
+      "Bash(jj config *)",
+      "Bash(jj metaedit *)",
+      "Bash(jj git *)",
+      "Bash(jj bookmark *)"
+    ]
+  }
+}
