@@ -34,7 +34,7 @@ static int test_morton() {
     for (uint32_t bx = 0; bx < 64; bx++) {
         for (uint32_t by_ = 0; by_ < 64; by_++) {
             for (uint32_t bz = 0; bz < 64; bz++) {
-                uint32_t code = morton_encode(bx, by_, bz);
+                uint64_t code = morton_encode(bx, by_, bz);
                 auto [rbx, rby, rbz] = morton_decode(code);
                 if (bx != rbx || by_ != rby || bz != rbz) {
                     std::cerr << "FAIL at (" << bx << "," << by_ << "," << bz
@@ -44,6 +44,27 @@ static int test_morton() {
             }
         }
     }
+
+    const std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> high_cases = {
+        {255, 255, 255}, {256, 0, 0}, {0, 256, 0}, {0, 0, 256},
+        {511, 513, 1025}, {4096, 8191, 16383},
+        {0x1FFFFF, 0x1FFFFF, 0x1FFFFF}
+    };
+    for (const auto& [bx, by_, bz] : high_cases) {
+        uint64_t code = morton_encode(bx, by_, bz);
+        auto [rbx, rby, rbz] = morton_decode(code);
+        if (bx != rbx || by_ != rby || bz != rbz) {
+            std::cerr << "FAIL high case at (" << bx << "," << by_ << "," << bz
+                      << ") -> (" << rbx << "," << rby << "," << rbz << ")\n";
+            return 1;
+        }
+    }
+
+    if (morton_encode(256, 0, 0) == morton_encode(0, 0, 0)) {
+        std::cerr << "FAIL: bit 8 was not preserved\n";
+        return 1;
+    }
+
     std::cout << "PASS\n";
     return 0;
 }

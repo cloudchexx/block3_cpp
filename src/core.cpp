@@ -122,7 +122,7 @@ uint64_t auto_block_size(uint64_t dim_x, uint64_t dim_y, uint64_t dim_z,
 
 std::vector<std::tuple<uint32_t, uint32_t, uint32_t>>
 BlockLayout3D::block_order() const {
-    struct Entry { uint32_t code, bx, by_, bz; };
+    struct Entry { uint64_t code; uint32_t bx, by_, bz; };
     std::vector<Entry> entries;
     entries.reserve(total_blocks);
 

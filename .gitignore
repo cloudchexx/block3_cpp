@@ -1,6 +1,9 @@
 # Build output
 build/
 
+# Claude Code local settings
+.claude/
+
 # Large data files
 *.dat
 *.b3d

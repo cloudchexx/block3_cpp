@@ -29,7 +29,7 @@ block data
 - `morton_encode(bx, by, bz)`
 - `morton_decode(code)`
 
-当前编码只保留每轴低 8 位。
+编码使用 64-bit Morton code，每轴保留低 21 位。
 
 ### `BlockLayout3D`
 

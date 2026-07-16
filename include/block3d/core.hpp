@@ -21,32 +21,35 @@ StorageClass detect_storage_medium(const std::string& output_dir);
 uint64_t auto_block_size(uint64_t dim_x, uint64_t dim_y, uint64_t dim_z,
                          StorageClass medium);
 
-inline uint32_t spread_bits(uint32_t v) {
-    v = (v | (v << 16)) & 0x030000FF;
-    v = (v | (v << 8))  & 0x0300F00F;
-    v = (v | (v << 4))  & 0x030C30C3;
-    v = (v | (v << 2))  & 0x09249249;
-    return v;
+inline uint64_t spread_bits(uint32_t v) {
+    uint64_t x = v & 0x1FFFFFULL;
+    x = (x | (x << 32)) & 0x001F00000000FFFFULL;
+    x = (x | (x << 16)) & 0x001F0000FF0000FFULL;
+    x = (x | (x << 8))  & 0x100F00F00F00F00FULL;
+    x = (x | (x << 4))  & 0x10C30C30C30C30C3ULL;
+    x = (x | (x << 2))  & 0x1249249249249249ULL;
+    return x;
 }
 
-inline uint32_t compact_bits(uint32_t v, uint32_t mask) {
-    v = v & mask;
-    v = (v | (v >> 2)) & 0x030C30C3;
-    v = (v | (v >> 4)) & 0x0300F00F;
-    v = (v | (v >> 8)) & 0x030000FF;
-    v = (v | (v >> 16)) & 0x000000FF;
-    return v;
+inline uint32_t compact_bits(uint64_t v) {
+    v &= 0x1249249249249249ULL;
+    v = (v ^ (v >> 2))  & 0x10C30C30C30C30C3ULL;
+    v = (v ^ (v >> 4))  & 0x100F00F00F00F00FULL;
+    v = (v ^ (v >> 8))  & 0x001F0000FF0000FFULL;
+    v = (v ^ (v >> 16)) & 0x001F00000000FFFFULL;
+    v = (v ^ (v >> 32)) & 0x1FFFFFULL;
+    return static_cast<uint32_t>(v);
 }
 
-inline uint32_t morton_encode(uint32_t bx, uint32_t by_, uint32_t bz) {
+inline uint64_t morton_encode(uint32_t bx, uint32_t by_, uint32_t bz) {
     return spread_bits(bx) | (spread_bits(by_) << 1) | (spread_bits(bz) << 2);
 }
 
 inline std::tuple<uint32_t, uint32_t, uint32_t>
-morton_decode(uint32_t code) {
-    uint32_t bx = compact_bits(code, 0x09249249);
-    uint32_t by_ = compact_bits(code >> 1, 0x09249249);
-    uint32_t bz = compact_bits(code >> 2, 0x09249249);
+morton_decode(uint64_t code) {
+    uint32_t bx = compact_bits(code);
+    uint32_t by_ = compact_bits(code >> 1);
+    uint32_t bz = compact_bits(code >> 2);
     return {bx, by_, bz};
 }
 

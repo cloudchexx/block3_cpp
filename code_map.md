@@ -62,7 +62,7 @@ ctest --test-dir build -C Release --output-on-failure
 - `max_memory_mb` 是局部软预算，不是整个进程内存上限。
 - reader 的共享块列表缓存必须在线程锁外使用副本。
 - 性能结果必须结合 OS 页缓存状态解释。
-- Morton 位扩展当前只保留每轴低 8 位；每轴块数超过 256 时编码可能碰撞。
+- Morton 位扩展使用 64-bit code，每轴保留低 21 位。
 - `convert` 默认自适应块大小（存储探测 + `auto_block_size()`）；`--block-size 0` 或不传即为自动，显式 N 可覆盖。
 - `read_x/y/z_slice` 现已内置切片内多线程块处理；`read_slices_batch` 已简化为顺序调用来避免超额订阅。
 - `--warm-up` 标志（`cli bench` 和 `run_test`）在计时前将数据区预加载到 OS 页缓存。
