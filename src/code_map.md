@@ -78,13 +78,14 @@ read_*_slice()
 
 ### `run_test.cpp` -> `run_test`
 
-面向 `test18`、`test50` 的独立工具：
+面向 `test18`、`test50` 及自定义数据集的综合性能工具：
 
-- 定位数据文件和复用有效 `.b3d`；
-- 可选转换、随机点校验和 warm-up；
+- 定位数据文件和复用有效 `.b3d`（含 block_size 校验）；
+- 可选转换、自动 block_size 探测、随机点校验和 warm-up；
 - 生成随机/连续切片请求；
 - 读取并把每张切片写盘；
 - 可选 `fflush` + `_commit/fsync`；
-- 输出吞吐、平均时间、轴平衡、存储比例和日志。
+- 输出吞吐、平均时间、轴平衡、存储比例和日志；
+- 支持自定义数据集：`--datasets <name> --dim-x N --dim-y N --dim-z N`，文件自动映射为 `<name>.dat` / `<name>.b3d`。
 
 其计时包含切片结果写盘，不包含 reader 构造和 mmap。

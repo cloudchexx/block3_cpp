@@ -716,6 +716,7 @@ int main(int argc, char* argv[]) {
     bool output_sync = true; // default: request persistence
     std::string axis_arg = "all";
     std::string mode_arg = "all";
+    uint64_t custom_dx = 0, custom_dy = 0, custom_dz = 0;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -756,6 +757,12 @@ int main(int argc, char* argv[]) {
             warmup_stride_val = std::atoi(argv[++i]);
         } else if (arg == "--warmup-memory" && i + 1 < argc) {
             warmup_memory_mb = std::atoi(argv[++i]);
+        } else if (arg == "--dim-x" && i + 1 < argc) {
+            custom_dx = std::strtoull(argv[++i], nullptr, 10);
+        } else if (arg == "--dim-y" && i + 1 < argc) {
+            custom_dy = std::strtoull(argv[++i], nullptr, 10);
+        } else if (arg == "--dim-z" && i + 1 < argc) {
+            custom_dz = std::strtoull(argv[++i], nullptr, 10);
         }
     }
 
@@ -954,17 +961,28 @@ int main(int argc, char* argv[]) {
 
     int ret = 0;
     for (const auto& ds_name : datasets) {
+        DatasetInfo cfg;
         auto it = DATASETS.find(ds_name);
-        if (it == DATASETS.end()) {
-            std::cout << "[ERROR] Unknown dataset: " << ds_name
-                      << ". Available:";
-            for (const auto& [k, v] : DATASETS) std::cout << " " << k;
-            std::cout << "\n";
-            ret = 1;
-            break;
+        if (it != DATASETS.end()) {
+            cfg = it->second;
+        } else {
+            // Custom dataset: requires --dim-x/--dim-y/--dim-z.
+            if (custom_dx == 0 || custom_dy == 0 || custom_dz == 0) {
+                std::cout << "[ERROR] Unknown dataset: " << ds_name
+                          << ". Available:";
+                for (const auto& [k, v] : DATASETS) std::cout << " " << k;
+                std::cout << "\n"
+                          << "        For custom datasets, specify"
+                          << " --dim-x N --dim-y N --dim-z N\n";
+                ret = 1;
+                break;
+            }
+            cfg.raw   = ds_name + ".dat";
+            cfg.b3d   = ds_name + ".b3d";
+            cfg.dim_x = custom_dx;
+            cfg.dim_y = custom_dy;
+            cfg.dim_z = custom_dz;
         }
-
-        auto cfg = it->second;
         resolve(cfg);
 
         if (!fs::exists(cfg.raw)) {

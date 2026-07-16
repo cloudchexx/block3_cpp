@@ -16,7 +16,11 @@
       "Bash(python3 -c ' *)",
       "Bash(build/Release/run_test.exe --datasets test18 --warm-up --mode random --axis all)",
       "Bash(build/Release/run_test.exe --datasets test18 --warm-up --mode sequential --axis all)",
-      "Bash(jj --no-pager bookmark list)"
+      "Bash(jj --no-pager bookmark list)",
+      "Bash(jj --no-pager log -r '::@' --limit 4)",
+      "Bash(cmake --build build --config Release --target run_test)",
+      "Bash(cp build/Release/run_test.exe 打包文件/bin/)",
+      "Bash(jj desc -m 'Add custom dataset support to run_test *)"
     ]
   }
 }

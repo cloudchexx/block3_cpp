@@ -35,6 +35,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `run_test` 的性能数据受 OS 页缓存影响，不要把同进程多个轴/模式称为独立冷缓存测试。
 - `--warm-up` 标志（`bench` 和 `run_test` 均支持）在计时前将数据区预加载到 OS 页缓存；预热后的测量结果是热缓存数据。
 - `convert` 的 `--block-size` 默认值为 0（自动检测）；显式 N 可覆盖。`--block-size 0` 与省略等效。验证区间为 0 或 16–256。
+- `run_test` 除内置 `test18`/`test50` 外，支持自定义数据集：未识别的名称通过 `--dim-x/--dim-y/--dim-z` 指定维度，文件自动推导为 `{name}.dat` / `{name}.b3d`。
 
 ## 构建与验证
 
