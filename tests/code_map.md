@@ -33,6 +33,9 @@ create small raw file
  -> old/wrong argument order must fail cleanly
  -> missing raw must fail
  -> missing b3d must fail
+ -> cache-prepare small scrub file
+ -> bench both/hot-only cache mode smoke tests
+ -> invalid/conflicting cache args fail cleanly
  -> cleanup
 ```
 
@@ -45,4 +48,4 @@ test_block3d executable -> CTest test_block3d
 test_cli executable     -> CTest test_cli
 ```
 
-`run_test` 不在本目录，也不是 CTest；它是大数据性能工具。
+`run_test` 不在本目录，也不是 CTest；它是大数据性能工具。修改 `run_test` 的 cold/hot、输出目录或日志行为后，应单独运行 smoke benchmark；需要性能确认时再使用 `block3d-data/test18` 与 `block3d-cache/scrub.bin` 跑完整流程。

@@ -128,16 +128,20 @@ void MappedFile::prefault(size_t offset, size_t length, size_t stride) {
     WIN32_MEMORY_RANGE_ENTRY entry;
     entry.VirtualAddress = const_cast<void*>(static_cast<const void*>(base));
     entry.NumberOfBytes  = length;
-    if (PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0)) return;
+    PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
 #else
-    if (::madvise(static_cast<char*>(mapped_data_) + offset,
-                  length, MADV_WILLNEED) == 0) return;
+    ::madvise(static_cast<char*>(mapped_data_) + offset,
+              length, MADV_WILLNEED);
 #endif
 
-    volatile uint8_t sink;
+    // PrefetchVirtualMemory/madvise are hints only. Complete the warm-up
+    // contract by synchronously touching every requested stride and the final
+    // byte before returning.
+    volatile uint8_t sink = 0;
     for (size_t pos = 0; pos < length; pos += stride) {
-        sink = base[pos];
+        sink ^= base[pos];
     }
+    sink ^= base[length - 1];
     (void)sink;
 }
 
@@ -218,7 +222,10 @@ void BlockedFileReader::warm_up(bool async, size_t stride,
 
     uint64_t bs = block_size_;
     uint64_t data_size = total_blocks_ * bs * bs * bs * sizeof(float);
-    uint64_t prefault_size = data_size;
+    uint64_t mapped_data_size = mapped_file_.size() > data_offset_
+        ? static_cast<uint64_t>(mapped_file_.size() - data_offset_)
+        : 0;
+    uint64_t prefault_size = std::min(data_size, mapped_data_size);
     if (max_memory_mb > 0) {
         uint64_t max_bytes = max_memory_mb * 1024ULL * 1024ULL;
         if (prefault_size > max_bytes) prefault_size = max_bytes;

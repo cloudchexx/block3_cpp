@@ -32,7 +32,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `cli.cpp` 的 `verify` 参数顺序固定为 `<b3d> <raw>`。
 - 顶层 `main()` 必须捕获库异常并以非零退出码报告，避免 Windows fast-fail。
 - `block3d_cli bench` 只测读取；`run_test.cpp` 测读取、输出写盘和可选同步。修改输出时保持两种口径的区别清晰。
-- `run_test` 的性能数据受 OS 页缓存影响，不要把同进程多个轴/模式称为独立冷缓存测试。
+- `benchmark_cache.cpp` 只服务 benchmark 私有逻辑：cache mode 参数、scrub 文件创建/读取、页面大小/物理内存查询、phase 日志和 plan hash。不要把自动 scrub 或自动完整预热塞进 reader 构造函数。
+- `block3d_cli bench` 和 `run_test` 默认 `--cache-mode both`，先 cold 再 hot；`--warm-up` 保持旧脚本兼容，但语义是 hot-only。`--warm-up` 与 `--cache-mode cold/both` 冲突时必须报错。
+- cold scrub 成功条件包括 scrub 文件存在、容量满足本轮 ratio、完整读取、逐页触碰、访问尾字节、checksum 输出和 settle 等待；失败时不输出 cold 成绩、不降级。
+- cold/hot 阶段必须复用同一不可变请求计划并输出 `PLAN_HASH`；reader 在各 phase 重新创建，避免把 reader 内部缓存收益混入 OS 页缓存对比。
+- `block3d_cli bench` 计时范围为 `read_only`，不写结果；`run_test` 计时范围为 `read_write_total`，主指标 `total_sec` 含切片读取、输出文件写入/关闭和可选 `_commit`/`fsync`。
+- `run_test both` 必须使用独立 phase 目录（`cold_scrubbed/`、`hot_prefetched/` 或 `cold_first_touch/`），运行前估算输出空间，完成后逐文件校验 cold/hot 输出一致；日志默认保存到当前工作目录 `logs/` 且包含 stderr。
 - `--warm-up` 标志（`bench` 和 `run_test` 均支持）在计时前将数据区预加载到 OS 页缓存；预热后的测量结果是热缓存数据。
 - `convert` 的 `--block-size` 默认值为 0（自动检测）；显式 N 可覆盖。`--block-size 0` 与省略等效。验证区间为 0 或 16–256。
 - `run_test` 除内置 `test18`/`test50` 外，支持自定义数据集：未识别的名称通过 `--dim-x/--dim-y/--dim-z` 指定维度，文件自动推导为 `{name}.dat` / `{name}.b3d`。

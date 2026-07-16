@@ -31,7 +31,8 @@ ctest --test-dir build -C Release -R '^test_cli$' --output-on-failure
 - 测试数据保持足够小，使用系统临时目录并清理输出，不依赖根目录的大型 `.dat/.b3d`。
 - 格式或布局变更必须覆盖完整 roundtrip、三轴切片、列、子体积和存储比例。
 - reader 缓存或批量并发变更必须保留并扩展 `test_concurrent_adjacent_same_block_key`；该测试防止缓存内部引用失效造成 use-after-free。
-- CLI 参数、文件缺失、坏 magic 或异常处理变更应放到 `test_cli.cpp`，通过真实进程和退出码验证。
+- CLI 参数、cache-prepare、bench 缓存阶段输出、文件缺失、坏 magic 或异常处理变更应放到 `test_cli.cpp`，通过真实进程和退出码验证。
+- `run_test` 是大数据性能工具，不纳入默认 CTest；修改其真实大数据路径后，需要单独用 `block3d-data/test18` 和 `block3d-cache/scrub.bin` 跑 smoke 或完整 benchmark。
 - `test_cli` 期望 `block3d_cli` 位于测试可执行文件旁。若调整 CMake 输出目录或目标依赖，同步修正定位逻辑。
 - Windows 进程测试使用 `CreateProcessW`，不要退回易受多层引号影响的 `cmd.exe` 拼接。
 

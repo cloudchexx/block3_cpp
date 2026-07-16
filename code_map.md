@@ -10,7 +10,7 @@
 | `src/` | 块转换、mmap reader、CLI、大数据测试实现 | [`src/code_map.md`](src/code_map.md) |
 | `tests/` | 库功能、并发回归和真实 CLI 进程测试 | [`tests/code_map.md`](tests/code_map.md) |
 | `generator_py/` | 随机三维数据生成器及 CLI/GUI/TUI | [`generator_py/code_map.md`](generator_py/code_map.md) |
-| `CMakeLists.txt` | C++17、OpenMP 和五个构建目标 | 本文“构建目标” |
+| `CMakeLists.txt` | C++17、OpenMP 和库/CLI/测试构建目标 | 本文“构建目标” |
 | `项目需求文档.md` | 数据格式、官方环境、功能和评分要求 | 原始需求文档 |
 
 ## 端到端数据流
@@ -45,7 +45,8 @@ fixed-size blocks                     # Morton/Z-order 物理顺序
 | 目标 | 作用 |
 |---|---|
 | `block3d` | `core.cpp`、`reader.cpp`、`converter.cpp` 库 |
-| `block3d_cli` | `convert/info/bench/verify/extract` CLI |
+| `block3d_benchmark_cache` | cold/hot 参数、scrub 文件准备与逐页冲刷的 benchmark 私有库 |
+| `block3d_cli` | `convert/info/cache-prepare/bench/verify/extract` CLI |
 | `test_block3d` | 库级测试可执行文件 |
 | `test_cli` | 启动真实 CLI 的集成测试 |
 | `run_test` | 大数据转换、写盘和性能工具；不属于 CTest |
@@ -58,11 +59,13 @@ ctest --test-dir build -C Release --output-on-failure
 
 ## 关键跨模块约束
 
-- `block3d_cli bench` 只计读取；`run_test` 计读取与输出写盘/同步。
+- `block3d_cli bench` 只计读取；`run_test` 计读取与输出写盘/同步。两者都支持 `cold`/`hot`/`both` 缓存阶段，计时口径不能混用。
+- `run_test both` 在同一固定计划上依次执行 scrub cold 与 warm-up hot，写入独立 phase 目录，比较 `total_sec`，并逐文件校验 cold/hot 输出一致；运行日志默认写入当前工作目录的 `logs/`。
 - `max_memory_mb` 是局部软预算，不是整个进程内存上限。
 - reader 的共享块列表缓存必须在线程锁外使用副本。
 - 性能结果必须结合 OS 页缓存状态解释。
 - Morton 位扩展使用 64-bit code，每轴保留低 21 位。
 - `convert` 默认自适应块大小（存储探测 + `auto_block_size()`）；`--block-size 0` 或不传即为自动，显式 N 可覆盖。
 - `read_x/y/z_slice` 现已内置切片内多线程块处理；`read_slices_batch` 已简化为顺序调用来避免超额订阅。
-- `--warm-up` 标志（`cli bench` 和 `run_test`）在计时前将数据区预加载到 OS 页缓存。
+- `block3d_cli cache-prepare` 创建可复用 scrub 文件；`bench --cold-method scrub` 逐页读取该文件作为本地 `cold_scrubbed` 口径。
+- `--warm-up` 标志（`cli bench` 和 `run_test`）在计时前将数据区预加载到 OS 页缓存；`cli bench` 中它是 `--cache-mode hot` 的兼容别名。

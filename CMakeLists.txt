@@ -23,8 +23,13 @@ if(MSVC)
         $<$<CONFIG:Release>:/arch:AVX2 /fp:fast>)
 endif()
 
+add_library(block3d_benchmark_cache
+    src/benchmark_cache.cpp
+)
+target_include_directories(block3d_benchmark_cache PUBLIC include PRIVATE src)
+
 add_executable(block3d_cli src/cli.cpp)
-target_link_libraries(block3d_cli PRIVATE block3d)
+target_link_libraries(block3d_cli PRIVATE block3d block3d_benchmark_cache)
 
 enable_testing()
 
@@ -39,9 +44,9 @@ add_executable(test_cli tests/test_cli.cpp)
 add_test(NAME test_cli COMMAND test_cli)
 
 add_executable(run_test src/run_test.cpp)
-target_link_libraries(run_test PRIVATE block3d)
+target_link_libraries(run_test PRIVATE block3d block3d_benchmark_cache)
 
 if(MSVC)
-    set_target_properties(block3d block3d_cli run_test test_block3d test_cli
+    set_target_properties(block3d block3d_benchmark_cache block3d_cli run_test test_block3d test_cli
         PROPERTIES INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
 endif()

@@ -39,6 +39,7 @@
 #include <iostream>
 #include <cstdint>
 #include <system_error>
+#include <sstream>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -86,6 +87,53 @@ static int run_cmd(const std::string& cmd) {
 #endif
 }
 
+static int run_cmd_to_file(const std::string& cmd, const fs::path& out_path) {
+#ifdef _WIN32
+    int clen = MultiByteToWideChar(CP_UTF8, 0, cmd.c_str(), -1, nullptr, 0);
+    if (clen <= 0) return -1;
+    std::vector<wchar_t> wcmd(static_cast<size_t>(clen));
+    MultiByteToWideChar(CP_UTF8, 0, cmd.c_str(), -1, wcmd.data(), clen);
+
+    std::string out_utf8 = out_path.u8string();
+    int plen = MultiByteToWideChar(CP_UTF8, 0, out_utf8.c_str(), -1, nullptr, 0);
+    if (plen <= 0) return -1;
+    std::vector<wchar_t> wpath(static_cast<size_t>(plen));
+    MultiByteToWideChar(CP_UTF8, 0, out_utf8.c_str(), -1, wpath.data(), plen);
+
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    HANDLE hOut = CreateFileW(wpath.data(), GENERIC_WRITE, FILE_SHARE_READ,
+                              &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hOut == INVALID_HANDLE_VALUE) return -1;
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = hOut;
+    si.hStdError = hOut;
+    PROCESS_INFORMATION pi{};
+    BOOL ok = CreateProcessW(nullptr, wcmd.data(), nullptr, nullptr, TRUE,
+                             0, nullptr, nullptr, &si, &pi);
+    if (!ok) {
+        CloseHandle(hOut);
+        return -1;
+    }
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 0;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    CloseHandle(hOut);
+    return static_cast<int>(code);
+#else
+    std::string full = cmd + " > " + q(out_path) + " 2>&1";
+    return run_cmd(full);
+#endif
+}
+
 // Locate block3d_cli next to this test executable (same build output dir),
 // falling back to the current working directory.
 static fs::path find_cli(const char* argv0) {
@@ -127,6 +175,7 @@ int main(int argc, char* argv[]) {
     fs::create_directories(tmp, ec);
     fs::path raw = tmp / "in.dat";
     fs::path b3d = tmp / "out.b3d";
+    fs::path scrub = tmp / "cache scrub.bin";
 
     constexpr uint64_t dx = 16, dy = 20, dz = 24;
     constexpr uint64_t total = dx * dy * dz;
@@ -155,6 +204,23 @@ int main(int argc, char* argv[]) {
             std::cout << " FAIL (crash 0xC0000409 -- uncaught exception)\n"; failures++;
         } else {
             std::cout << " PASS (clean failure)\n";
+        }
+    };
+    auto expect_output_contains = [&](const char* label, const std::string& cmd,
+                                      const std::string& needle) {
+        fs::path out = tmp / (std::string("cmd_output_") + std::to_string(failures) + ".txt");
+        int rc = run_cmd_to_file(cmd, out);
+        std::ifstream f(out);
+        std::ostringstream ss;
+        ss << f.rdbuf();
+        std::string text = ss.str();
+        std::cout << "  " << label << ": exit=" << rc;
+        if (rc == 0 && text.find(needle) != std::string::npos) {
+            std::cout << " PASS\n";
+        } else {
+            std::cout << " FAIL (want exit 0 and output containing '" << needle << "')\n";
+            std::cout << text << "\n";
+            failures++;
         }
     };
 
@@ -188,6 +254,36 @@ int main(int argc, char* argv[]) {
     // 5. verify with a non-existent b3d -> clean failure, no crash.
     expect_clean_fail("verify missing b3d (no crash)",
                       q(cli) + " verify " + q(nope) + " " + q(raw) + " --samples 10");
+
+    // 6. cache-prepare creates a reusable non-empty scrub file, including paths
+    //    with spaces, without making bench create it implicitly.
+    expect_ok("cache-prepare small scrub",
+              q(cli) + " cache-prepare " + q(scrub) + " --size 1MB");
+    if (!fs::exists(scrub) || fs::file_size(scrub) != 1024 * 1024) {
+        std::cout << "  cache-prepare file size: FAIL\n";
+        failures++;
+    }
+
+    // 7. Default both-mode can be exercised on tiny data with --cold-method none;
+    //    it must emit cold/hot phases and matching plan hashes without requiring
+    //    unstable timing assertions.
+    expect_output_contains("bench both cold-hot",
+        q(cli) + " bench " + q(b3d)
+        + " --num-reads 2 --threads 2 --cache-mode both --cold-method none --warmup-scope workload",
+        "BENCHMARK_COMPARE");
+
+    // 8. Compatibility --warm-up means hot-only, and invalid/conflicting cache
+    //    parameters fail cleanly instead of running the wrong benchmark state.
+    expect_output_contains("bench warm-up hot-only",
+        q(cli) + " bench " + q(b3d)
+        + " --num-reads 1 --threads 2 --warm-up --warmup-scope workload",
+        "CACHE_PHASE name=hot_prefetched");
+    expect_clean_fail("bench invalid cache-mode",
+        q(cli) + " bench " + q(b3d) + " --cache-mode tepid --cold-method none");
+    expect_clean_fail("bench warm-up conflict",
+        q(cli) + " bench " + q(b3d) + " --warm-up --cache-mode both --cold-method none");
+    expect_clean_fail("bench missing scrub file",
+        q(cli) + " bench " + q(b3d) + " --cache-mode cold --cold-method scrub --cold-scrub-file " + q(nope));
 
     fs::remove_all(tmp, ec);
 

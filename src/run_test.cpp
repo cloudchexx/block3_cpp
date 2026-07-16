@@ -1,6 +1,7 @@
 #include "block3d/reader.hpp"
 #include "block3d/converter.hpp"
 #include "block3d/rng.hpp"
+#include "benchmark_cache.hpp"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -18,6 +19,9 @@
 #include <thread>
 #include <cstdio>
 #include <limits>
+#include <array>
+#include <cstdint>
+#include <system_error>
 
 #ifdef _WIN32
 #include <io.h>      // _commit
@@ -32,8 +36,10 @@ using namespace block3d;
 // ── Tee streambuf (duplicate cout to log file) ───────────────────────
 
 static std::streambuf* g_console_rdbuf = nullptr;
+static std::streambuf* g_console_err_rdbuf = nullptr;
 static std::ofstream   g_log_file;
 static std::streambuf* g_tee_buf = nullptr;
+static std::streambuf* g_err_tee_buf = nullptr;
 static std::string     g_run_id;  // shared, unique: log name + per-run output dir
 
 class TeeBuf : public std::streambuf {
@@ -108,12 +114,20 @@ static void setup_logging(const std::vector<std::string>& datasets) {
     }
 
     g_console_rdbuf = std::cout.rdbuf();
+    g_console_err_rdbuf = std::cerr.rdbuf();
     g_tee_buf = new TeeBuf(g_console_rdbuf, g_log_file.rdbuf());
+    g_err_tee_buf = new TeeBuf(g_console_err_rdbuf, g_log_file.rdbuf());
     std::cout.rdbuf(g_tee_buf);
+    std::cerr.rdbuf(g_err_tee_buf);
     std::cout << "Log saved to: " << log_path << "\n\n";
 }
 
 static void teardown_logging() {
+    if (g_err_tee_buf) {
+        std::cerr.rdbuf(g_console_err_rdbuf);
+        delete g_err_tee_buf;
+        g_err_tee_buf = nullptr;
+    }
     if (g_tee_buf) {
         std::cout.rdbuf(g_console_rdbuf);
         delete g_tee_buf;
@@ -230,6 +244,8 @@ static std::vector<uint64_t> make_seq_indices(uint64_t start,
 // This is NOT an end-to-end measurement including process/reader setup.
 
 struct BenchResult {
+    double read_sec = 0;
+    double write_sec = 0;
     double total_sec = 0;
     double avg_ms = 0;
     double throughput = 0;
@@ -240,6 +256,19 @@ struct BenchResult {
     std::vector<uint64_t> slice_bytes;
     bool io_error = false;
 };
+
+static fs::path output_file_path(const fs::path& out_dir,
+                                const std::string& ds_name,
+                                char axis,
+                                const std::string& mode,
+                                size_t seq,
+                                uint64_t index) {
+    std::ostringstream fn;
+    fn << ds_name << "_" << axis << "_" << mode << "_"
+       << std::setw(4) << std::setfill('0') << seq
+       << "_idx" << index << ".raw";
+    return out_dir / fn.str();
+}
 
 static BenchResult run_bench(const std::string& b3d_path,
                               char axis,
@@ -257,6 +286,8 @@ static BenchResult run_bench(const std::string& b3d_path,
 
     auto t0 = std::chrono::high_resolution_clock::now();
     auto slices = reader.read_slices_batch(axis, indices);
+    auto t_read_done = std::chrono::high_resolution_clock::now();
+    r.read_sec = std::chrono::duration<double>(t_read_done - t0).count();
     r.n_read = slices.size();
     r.slice_bytes.assign(slices.size(), 0);
 
@@ -269,15 +300,12 @@ static BenchResult run_bench(const std::string& b3d_path,
         r.io_error = true;
         auto t1 = std::chrono::high_resolution_clock::now();
         r.total_sec = std::chrono::duration<double>(t1 - t0).count();
+        r.write_sec = std::chrono::duration<double>(t1 - t_read_done).count();
         return r;
     }
 
     for (size_t i = 0; i < slices.size(); i++) {
-        std::ostringstream fn;
-        fn << ds_name << "_" << axis << "_" << mode << "_"
-           << std::setw(4) << std::setfill('0') << i
-           << "_idx" << indices[i] << ".raw";
-        fs::path fp = out_dir / fn.str();
+        fs::path fp = output_file_path(out_dir, ds_name, axis, mode, i, indices[i]);
         std::string fp_str = fp.string();
 
         FILE* f = std::fopen(fp_str.c_str(), "wb");
@@ -306,6 +334,7 @@ static BenchResult run_bench(const std::string& b3d_path,
     }
     auto t1 = std::chrono::high_resolution_clock::now();
 
+    r.write_sec = std::chrono::duration<double>(t1 - t_read_done).count();
     r.total_sec = std::chrono::duration<double>(t1 - t0).count();
     // Success metrics exist ONLY when every requested slice was written.
     if (!r.io_error && r.n_written > 0 && r.n_written == r.n_read
@@ -348,7 +377,11 @@ static void log_per_slice_bytes(const BenchResult& r) {
 // invoke this when any case in the group had an I/O error (we abort instead).
 static void print_bench_table(const std::string& title,
                                const std::vector<char>& axes,
-                               const std::vector<BenchResult>& results) {
+                               const std::vector<BenchResult>& results,
+                               const std::string& cache_name,
+                               const std::string& mode,
+                               const std::vector<uint64_t>& plan_hashes,
+                               bool output_sync) {
     std::cout << "\n[" << title << "]\n";
     std::cout << "         " << std::left << std::setw(6) << "Axis"
               << std::right << std::setw(10) << "Total"
@@ -370,10 +403,24 @@ static void print_bench_table(const std::string& title,
                   << std::setw(9) << r.total_sec << "s"
                   << std::setw(10) << std::setprecision(2) << r.avg_ms << "ms"
                   << std::setw(12) << std::setprecision(1) << r.throughput
-                  << " slices/s  (read " << r.n_read
+                  << " slices/s  (read_sec=" << std::setprecision(3) << r.read_sec
+                  << "s, write_sec=" << r.write_sec << "s, read " << r.n_read
                   << ", written " << r.n_written << ", "
                   << size_str(r.total_bytes) << " written)\n";
         log_per_slice_bytes(r);
+        std::cout << "BENCHMARK_RESULT cache=" << cache_name
+                  << " mode=" << mode
+                  << " axis=" << axes[i]
+                  << " total_sec=" << r.total_sec
+                  << " read_sec=" << r.read_sec
+                  << " write_sec=" << r.write_sec
+                  << " avg_ms=" << r.avg_ms
+                  << " slices_per_sec=" << r.throughput
+                  << " count=" << r.n_written
+                  << " bytes=" << r.total_bytes
+                  << " output_sync=" << (output_sync ? "requested" : "disabled")
+                  << " plan_hash=" << std::hex << std::setw(16) << std::setfill('0')
+                  << plan_hashes[i] << std::dec << std::setfill(' ') << "\n";
         if (r.n_written > 0) {
             sum += r.avg_ms;
             if (r.avg_ms < mn) mn = r.avg_ms;
@@ -405,12 +452,211 @@ static void print_bench_table(const std::string& title,
 // This flag is process-wide (not per-dataset).
 static bool g_converted_b3d_in_process = false;
 
+struct BenchCasePlan {
+    char axis = 'x';
+    std::string mode;
+    std::string file_mode;
+    std::vector<uint64_t> indices;
+    uint64_t plan_hash = 0;
+};
+
+struct PhaseResults {
+    std::string cache_name;
+    std::map<std::string, std::vector<BenchResult>> by_mode;
+};
+
+static std::string hex_u64(uint64_t value) {
+    std::ostringstream oss;
+    oss << std::hex << std::setw(16) << std::setfill('0') << value;
+    return oss.str();
+}
+
+static uint64_t compute_plan_hash(const BenchCasePlan& plan,
+                                  const DatasetInfo& cfg,
+                                  uint32_t seed,
+                                  uint64_t seq_start) {
+    uint64_t hash = 1469598103934665603ULL;
+    hash = fnv1a64_update(hash, &plan.axis, sizeof(plan.axis));
+    hash = fnv1a64_update(hash, plan.mode.data(), plan.mode.size());
+    hash = fnv1a64_u64(hash, cfg.dim_x);
+    hash = fnv1a64_u64(hash, cfg.dim_y);
+    hash = fnv1a64_u64(hash, cfg.dim_z);
+    hash = fnv1a64_u64(hash, seed);
+    hash = fnv1a64_u64(hash, seq_start);
+    for (uint64_t index : plan.indices) hash = fnv1a64_u64(hash, index);
+    return hash;
+}
+
+static std::vector<BenchCasePlan> build_case_plans(
+        const DatasetInfo& cfg,
+        int random_count,
+        int seq_count,
+        uint32_t seed,
+        uint64_t seq_start,
+        const std::vector<char>& axes,
+        const std::vector<std::string>& modes) {
+    std::vector<BenchCasePlan> plans;
+    for (const auto& mode : modes) {
+        bool random = mode == "random";
+        for (char axis : axes) {
+            uint64_t dim = axis == 'x' ? cfg.dim_x : axis == 'y' ? cfg.dim_y : cfg.dim_z;
+            BenchCasePlan plan;
+            plan.axis = axis;
+            plan.mode = mode;
+            plan.file_mode = random ? "rand" : "seq";
+            plan.indices = random
+                ? make_rand_indices(seed, random_count, dim)
+                : make_seq_indices(seq_start, seq_count, dim);
+            plan.plan_hash = compute_plan_hash(plan, cfg, seed, seq_start);
+            plans.push_back(std::move(plan));
+        }
+    }
+    return plans;
+}
+
+static void log_scrub_result(const CacheScrubResult& scrub) {
+    std::cout << "CACHE_SCRUB method=unrelated_file_sweep\n"
+              << "CACHE_SCRUB file=" << scrub.path << "\n"
+              << "CACHE_SCRUB bytes=" << scrub.bytes_read
+              << " file_bytes=" << scrub.file_bytes
+              << " required_bytes=" << scrub.required_bytes
+              << " ram_ratio=" << scrub.ram_ratio
+              << " passes=" << scrub.passes << "\n"
+              << "CACHE_SCRUB elapsed_sec=" << scrub.elapsed_sec
+              << " checksum=" << scrub.checksum << "\n"
+              << "CACHE_VALIDITY state=" << scrub.message << "\n";
+}
+
+static bool run_cold_prepare(const CacheOptions& cache_options) {
+    if (cache_options.cold_method == ColdMethod::None) {
+        std::cout << "CACHE_SCRUB method=none\n"
+                  << "CACHE_VALIDITY state=cold_first_touch\n";
+        return true;
+    }
+    std::cout << "[Phase] Cache scrub\n";
+    auto scrub = run_cache_scrub(cache_options);
+    log_scrub_result(scrub);
+    if (!scrub.ok) {
+        std::cerr << "[ERROR] cache scrub failed: " << scrub.message << "\n";
+        return false;
+    }
+    return true;
+}
+
+static void warm_up_for_plans(const std::string& b3d_path,
+                              const std::vector<BenchCasePlan>& plans,
+                              WarmupScope scope,
+                              size_t stride,
+                              uint64_t memory_mb) {
+    auto t0 = std::chrono::high_resolution_clock::now();
+    uint64_t bytes = 0;
+    uint64_t checksum = 0;
+    {
+        BlockedFileReader reader(b3d_path);
+        if (scope == WarmupScope::Dataset) {
+            uint64_t bs = reader.block_size();
+            bytes = reader.total_blocks() * bs * bs * bs * sizeof(float);
+            reader.warm_up(false, stride, memory_mb);
+        } else {
+            for (const auto& plan : plans) {
+                auto slices = reader.read_slices_batch(plan.axis, plan.indices);
+                for (const auto& slice : slices) {
+                    bytes += slice.size() * sizeof(float);
+                    if (!slice.empty()) {
+                        checksum ^= static_cast<uint64_t>(slice.front() * 1000003.0f);
+                        checksum ^= static_cast<uint64_t>(slice.back() * 9176.0f);
+                    }
+                }
+            }
+        }
+    }
+    auto t1 = std::chrono::high_resolution_clock::now();
+    std::cout << "WARMUP_RESULT scope=" << to_string(scope)
+              << " elapsed_sec=" << std::chrono::duration<double>(t1 - t0).count()
+              << " bytes=" << bytes
+              << " checksum=" << checksum << "\n";
+}
+
+static bool files_equal(const fs::path& lhs, const fs::path& rhs) {
+    std::error_code ec;
+    uint64_t lhs_size = fs::file_size(lhs, ec);
+    if (ec) return false;
+    uint64_t rhs_size = fs::file_size(rhs, ec);
+    if (ec || lhs_size != rhs_size) return false;
+    std::ifstream a(lhs, std::ios::binary);
+    std::ifstream b(rhs, std::ios::binary);
+    std::vector<char> abuf(1024 * 1024);
+    std::vector<char> bbuf(1024 * 1024);
+    while (a && b) {
+        a.read(abuf.data(), static_cast<std::streamsize>(abuf.size()));
+        b.read(bbuf.data(), static_cast<std::streamsize>(bbuf.size()));
+        auto an = a.gcount();
+        auto bn = b.gcount();
+        if (an != bn || std::memcmp(abuf.data(), bbuf.data(), static_cast<size_t>(an)) != 0)
+            return false;
+    }
+    return a.eof() && b.eof();
+}
+
+static uint64_t slice_bytes_for_axis(const DatasetInfo& cfg, char axis) {
+    if (axis == 'x') return cfg.dim_y * cfg.dim_z * sizeof(float);
+    if (axis == 'y') return cfg.dim_x * cfg.dim_z * sizeof(float);
+    return cfg.dim_x * cfg.dim_y * sizeof(float);
+}
+
+static uint64_t estimate_output_bytes(const DatasetInfo& cfg,
+                                      const std::vector<BenchCasePlan>& plans,
+                                      CacheMode mode) {
+    uint64_t per_phase = 0;
+    for (const auto& plan : plans) {
+        uint64_t one = slice_bytes_for_axis(cfg, plan.axis);
+        if (plan.indices.size() > std::numeric_limits<uint64_t>::max() / one)
+            return std::numeric_limits<uint64_t>::max();
+        uint64_t add = one * static_cast<uint64_t>(plan.indices.size());
+        if (per_phase > std::numeric_limits<uint64_t>::max() - add)
+            return std::numeric_limits<uint64_t>::max();
+        per_phase += add;
+    }
+    uint64_t phases = cache_mode_has_cold(mode) && cache_mode_has_hot(mode) ? 2 : 1;
+    if (per_phase > std::numeric_limits<uint64_t>::max() / phases)
+        return std::numeric_limits<uint64_t>::max();
+    return per_phase * phases;
+}
+
+static bool verify_phase_outputs(const fs::path& cold_dir,
+                                 const fs::path& hot_dir,
+                                 const std::string& ds_name,
+                                 const std::vector<BenchCasePlan>& plans) {
+    uint64_t files = 0;
+    uint64_t bytes = 0;
+    for (const auto& plan : plans) {
+        for (size_t i = 0; i < plan.indices.size(); ++i) {
+            auto cold = output_file_path(cold_dir, ds_name, plan.axis,
+                                         plan.file_mode, i, plan.indices[i]);
+            auto hot = output_file_path(hot_dir, ds_name, plan.axis,
+                                        plan.file_mode, i, plan.indices[i]);
+            if (!files_equal(cold, hot)) {
+                std::cerr << "[ERROR] phase output mismatch: " << cold
+                          << " vs " << hot << "\n";
+                std::cout << "OUTPUT_VERIFY_RESULT ok=0 files_checked=" << files
+                          << " mismatch=" << cold.filename().string() << "\n";
+                return false;
+            }
+            bytes += fs::file_size(cold);
+            files++;
+        }
+    }
+    std::cout << "OUTPUT_VERIFY_RESULT ok=1 files_checked=" << files
+              << " bytes_checked=" << bytes << "\n";
+    return true;
+}
+
 static int run_full_test(const std::string& ds_name,
                            const DatasetInfo& cfg,
                            uint64_t block_size,
                            int random_count, int seq_count,
                            bool verify_enabled, int verify_samples,
-                           bool warm_up,
+                           const CacheOptions& cache_options,
                            size_t warmup_stride,
                            uint64_t warmup_memory_mb,
                            uint32_t seed,
@@ -510,194 +756,156 @@ static int run_full_test(const std::string& ds_name,
 
     unsigned hc = std::thread::hardware_concurrency();
     int thread_count = static_cast<int>(hc > 0 ? hc : 1);
-
-    std::cout << "\n[CONFIG] seed=" << seed
-              << " (fixed for random reads)\n";
-    std::cout << "         threads=" << thread_count << " (auto)\n";
-    std::cout << "         run_dir=" << run_dir.string()
-              << " (shared across datasets; files prefixed by dataset name)\n";
-    std::cout << "         output_pattern=" << ds_name
-              << "_<axis>_<mode>_<seq>_<idx>.raw  (mode=rand|seq, seq=0000..)\n";
-    std::cout << "         output_sync="
-              << (output_sync ? "requested" : "disabled") << "\n";
-    if (output_sync) {
-        std::cout << "           requested: after fflush, "
-#ifdef _WIN32
-                  << "_commit"
-#else
-                  << "fsync"
-#endif
-                  << " is issued per output file. Timing covers slice read +\n"
-                  << "           file create + write + close + sync. This does "
-                     "NOT guarantee bypassing\n"
-                  << "           the device firmware write cache.\n";
-    } else {
-        std::cout << "           disabled (--no-output-sync): data is committed "
-                     "to the OS only; this is a\n"
-                  << "           diagnostic mode and is NOT a durable/persisted "
-                     "result. The device firmware\n"
-                  << "           cache is NOT bypassed.\n";
+    auto plans = build_case_plans(cfg, random_count, seq_count, seed,
+                                  seq_start, sel_axes, sel_modes);
+    if (plans.empty()) {
+        std::cerr << "[ERROR] no benchmark cases generated\n";
+        return 1;
     }
-    std::cout << "         timing: steady-state batch = slice read "
-                 "(read_slices_batch) + per-slice raw\n"
-              << "                  float32 file create/write/close"
-              << (output_sync ? "/sync" : "") << ".\n"
-              << "                  Reader construction (open+mmap+header "
-                 "parse) is NOT timed.\n"
-              << "                  This is NOT an end-to-end measurement "
-                 "including process/reader setup.\n";
-
-    // Warm up OS page cache before benchmarks (hot-cache diagnostic only).
-    if (warm_up) {
-        std::cout << "\n[WARMUP] *** HOT-CACHE DIAGNOSTIC --warm-up ENABLED ***\n"
-                  << "         Preloading data pages (stride=" << warmup_stride;
-        if (warmup_memory_mb > 0)
-            std::cout << ", max_mem=" << warmup_memory_mb << "MB";
-        std::cout << ") ..." << std::flush;
-        auto t0 = std::chrono::high_resolution_clock::now();
-        {
-            BlockedFileReader reader(b3d_path);
-            reader.warm_up(false, warmup_stride, warmup_memory_mb);
-        }
-        auto t1 = std::chrono::high_resolution_clock::now();
-        double dt = std::chrono::duration<double>(t1 - t0).count();
-        std::cout << " done in " << std::fixed
-                  << std::setprecision(1) << dt << "s\n"
-                  << "         NOTE: numbers below are WARM-cache, NOT cold-cache.\n";
-    }
-
-    // If THIS process converted a b3d (above), the freshly-written b3d pages
-    // are very likely resident in the OS page cache. The benchmarks below in
-    // THIS process are therefore NOT cold-cache results. A proper cold-cache
-    // measurement requires: exit this process, have an external harness clear
-    // the OS page cache, then restart with the now-existing .b3d using a
-    // single --axis + single --mode. Do NOT interpret the numbers below as
-    // cold-cache.
-    if (g_converted_b3d_in_process) {
-        std::cout << "\n[CONVERSION-CACHE-NOTE] A .b3d was CONVERTED in this "
-                     "process. The newly-written\n"
-                  << "            b3d pages are very likely resident in the OS "
-                     "page cache, so the\n"
-                  << "            benchmark(s) below measured in THIS process "
-                     "are NOT cold-cache\n"
-                  << "            results. To obtain a cold-cache measurement: "
-                     "EXIT this process, have\n"
-                  << "            an external harness clear the OS page cache, "
-                     "then RESTART against the\n"
-                  << "            now-existing .b3d using a single --axis and a "
-                     "single --mode.\n";
-    }
-
-    uint64_t dims[3] = {cfg.dim_x, cfg.dim_y, cfg.dim_z};
-
-    // 3. Per-mode benchmarks over the selected axes only.
-    for (const auto& mode : sel_modes) {
-        bool is_rand = (mode == "random");
-        const std::string& mlabel = is_rand ? std::string("rand")
-                                            : std::string("seq");
-        const char* title = is_rand ? "RANDOM" : "SEQUENTIAL";
-
-        // Validate parameters for the cases we are about to generate.
-        int count = is_rand ? random_count : seq_count;
-        if (count <= 0) {
-            std::cout << "\n[ERROR] " << mode << " count=" << count
-                      << " must be > 0\n";
+    for (const auto& plan : plans) {
+        if (plan.indices.empty()) {
+            std::cerr << "[ERROR] generated " << plan.mode << " case for axis '"
+                      << plan.axis << "' produced 0 requests\n";
             return 1;
         }
-
-        if (!is_rand) {
-            // seq_start must be < the dimension of every selected axis.
-            for (char a : sel_axes) {
-                uint64_t dim = (a == 'x') ? dims[0]
-                              : (a == 'y') ? dims[1] : dims[2];
-                if (seq_start >= dim) {
-                    std::cout << "\n[ERROR] seq_start=" << seq_start
-                              << " must be < dim_" << a << "=" << dim
-                              << " for axis '" << a << "'\n";
-                    return 1;
-                }
-            }
-        }
-
-        std::cout << "\n[" << title << "] "
-                  << (is_rand
-                        ? ("seed=" + std::to_string(seed) + ", "
-                           + std::to_string(random_count)
-                           + " random slices per selected axis")
-                        : ("contiguous from start=" + std::to_string(seq_start)
-                           + ", requested=" + std::to_string(seq_count)
-                           + " (clamped to dim-start per axis)"))
-                  << "\n";
-
-        std::vector<BenchResult> results;
-        results.reserve(sel_axes.size());
-        for (char a : sel_axes) {
-            uint64_t dim = (a == 'x') ? dims[0]
-                          : (a == 'y') ? dims[1] : dims[2];
-            std::vector<uint64_t> idx = is_rand
-                ? make_rand_indices(seed, random_count, dim)
-                : make_seq_indices(seq_start, seq_count, dim);
-
-            if (!is_rand) {
-                std::cout << "         axis=" << a
-                          << " start_index=" << seq_start
-                          << " contiguous_length=" << idx.size()
-                          << " (dim=" << dim << ")\n";
-            }
-
-            // Each generated case must have at least 1 request.
-            if (idx.empty()) {
-                std::cout << "[ERROR] generated " << mode
-                          << " case for axis '" << a
-                          << "' produced 0 requests (dim=" << dim
-                          << ", count=" << count << ")\n";
-                return 1;
-            }
-
-            results.push_back(run_bench(b3d_path, a, mlabel,
-                                         idx, run_dir, ds_name,
-                                         output_sync));
-        }
-
-        // On ANY I/O error in this mode group, do NOT print a timing table
-        // (no avg/balance). Report and fail.
-        bool any_err = false;
-        for (size_t i = 0; i < sel_axes.size(); i++) {
-            if (results[i].io_error) {
-                std::cout << "[ERROR] I/O error during " << mode
-                          << " bench axis " << sel_axes[i]
-                          << " (read=" << results[i].n_read
-                          << ", written=" << results[i].n_written << ")\n";
-                any_err = true;
-            }
-        }
-        if (any_err) {
-            std::cout << "[ERROR] Skipping timing table for " << mode
-                      << " due to I/O errors above.\n";
-            return 1;
-        }
-
-        print_bench_table(title, sel_axes, results);
     }
 
-    // 4. Summary
-    {
-        auto raw_sz = fs::file_size(raw_path);
-        auto b3d_sz = fs::file_size(b3d_path);
-        double ratio = static_cast<double>(b3d_sz) / static_cast<double>(raw_sz);
-        std::cout << "\n" << std::string(70, '=') << "\n";
-        std::cout << "  SUMMARY -- " << ds_name << "\n";
-        std::cout << std::string(70, '=') << "\n";
-        std::cout << "  Storage:   " << size_str(b3d_sz)
-                  << " / " << size_str(raw_sz)
-                  << " = " << std::fixed << std::setprecision(3) << ratio << "x\n";
-        std::cout << "  Outputs:   " << run_dir.string() << "\n";
-        std::cout << std::string(70, '=') << "\n\n";
+    uint64_t suite_hash = 1469598103934665603ULL;
+    for (const auto& plan : plans) suite_hash = fnv1a64_u64(suite_hash, plan.plan_hash);
+
+    std::cout << "\n[CONFIG] seed=" << seed << " (fixed for random reads)\n"
+              << "         threads=" << thread_count << " (auto)\n"
+              << "         run_dir=" << run_dir.string() << "\n"
+              << "         output_pattern=<phase>/" << ds_name
+              << "_<axis>_<mode>_<seq>_<idx>.raw\n"
+              << "         output_sync=" << (output_sync ? "requested" : "disabled") << "\n"
+              << "         timing_scope=read_write_total\n";
+    std::cout << "CACHE_CONFIG mode=" << to_string(cache_options.mode)
+              << " cold_method=" << to_string(cache_options.cold_method)
+              << " cold_isolation=" << to_string(cache_options.cold_isolation)
+              << " warmup_scope=" << to_string(cache_options.warmup_scope)
+              << " timing_scope=read_write_total\n"
+              << "TIMING_SCOPE value=read_write_total\n"
+              << "PLAN_HASH_SUITE value=" << hex_u64(suite_hash) << "\n";
+    for (const auto& plan : plans) {
+        std::cout << "PLAN_HASH axis=" << plan.axis
+                  << " mode=" << plan.mode
+                  << " value=" << hex_u64(plan.plan_hash)
+                  << " count=" << plan.indices.size() << "\n";
     }
+
+    uint64_t estimated_bytes = estimate_output_bytes(cfg, plans, cache_options.mode);
+    auto available_bytes = fs::space(run_dir).available;
+    std::cout << "OUTPUT_SPACE estimated_bytes=" << estimated_bytes
+              << " available_bytes=" << available_bytes << "\n";
+    if (estimated_bytes > available_bytes) {
+        std::cerr << "[ERROR] insufficient output space for benchmark outputs\n";
+        return 1;
+    }
+
+    fs::path cold_dir = run_dir / (cache_options.cold_method == ColdMethod::Scrub
+                                   ? "cold_scrubbed" : "cold_first_touch");
+    fs::path hot_dir = run_dir / "hot_prefetched";
+    std::error_code ec;
+    if (cache_mode_has_cold(cache_options.mode)) fs::create_directories(cold_dir, ec);
+    if (!ec && cache_mode_has_hot(cache_options.mode)) fs::create_directories(hot_dir, ec);
+    if (ec) {
+        std::cerr << "[ERROR] cannot create phase output directories: " << ec.message() << "\n";
+        return 1;
+    }
+
+    auto run_phase = [&](const std::string& cache_name,
+                         const fs::path& phase_dir,
+                         bool scrub_each_case,
+                         PhaseResults& phase_results) -> bool {
+        phase_results.cache_name = cache_name;
+        for (const auto& mode : sel_modes) {
+            std::vector<BenchResult> results;
+            std::vector<uint64_t> hashes;
+            results.reserve(sel_axes.size());
+            hashes.reserve(sel_axes.size());
+            for (char axis : sel_axes) {
+                auto it = std::find_if(plans.begin(), plans.end(), [&](const BenchCasePlan& plan) {
+                    return plan.mode == mode && plan.axis == axis;
+                });
+                if (it == plans.end()) return false;
+                if (scrub_each_case && !run_cold_prepare(cache_options)) return false;
+                auto result = run_bench(b3d_path, it->axis, it->file_mode,
+                                        it->indices, phase_dir, ds_name, output_sync);
+                if (result.io_error) return false;
+                results.push_back(std::move(result));
+                hashes.push_back(it->plan_hash);
+            }
+            print_bench_table(mode == "random" ? "RANDOM" : "SEQUENTIAL",
+                              sel_axes, results, cache_name, mode, hashes, output_sync);
+            phase_results.by_mode.emplace(mode, std::move(results));
+        }
+        return true;
+    };
+
+    PhaseResults cold_results;
+    PhaseResults hot_results;
+    if (cache_mode_has_cold(cache_options.mode)) {
+        std::string cold_name = cache_options.cold_method == ColdMethod::Scrub
+            ? "cold_scrubbed" : "cold_first_touch";
+        std::cout << "\nCACHE_PHASE name=" << cold_name << "\n";
+        bool scrub_each_case = cache_options.cold_isolation == ColdIsolation::Case;
+        if (!scrub_each_case && !run_cold_prepare(cache_options)) return 1;
+        if (!run_phase(cold_name, cold_dir, scrub_each_case, cold_results)) return 1;
+    }
+
+    if (cache_mode_has_hot(cache_options.mode)) {
+        std::cout << "\n[Phase] Warm-up\n";
+        warm_up_for_plans(b3d_path, plans, cache_options.warmup_scope,
+                          warmup_stride, warmup_memory_mb);
+        std::cout << "CACHE_PHASE name=hot_prefetched\n";
+        if (!run_phase("hot_prefetched", hot_dir, false, hot_results)) return 1;
+    }
+
+    if (cache_mode_has_cold(cache_options.mode) && cache_mode_has_hot(cache_options.mode)) {
+        for (const auto& mode : sel_modes) {
+            const auto& cold = cold_results.by_mode.at(mode);
+            const auto& hot = hot_results.by_mode.at(mode);
+            for (size_t i = 0; i < sel_axes.size(); ++i) {
+                std::cout << "BENCHMARK_COMPARE mode=" << mode
+                          << " axis=" << sel_axes[i]
+                          << " observed_ratio="
+                          << (hot[i].total_sec > 0.0 ? cold[i].total_sec / hot[i].total_sec : 0.0)
+                          << "\n";
+            }
+        }
+        if (!verify_phase_outputs(cold_dir, hot_dir, ds_name, plans)) return 1;
+    }
+
+    auto raw_sz = fs::file_size(raw_path);
+    auto b3d_sz = fs::file_size(b3d_path);
+    double ratio = static_cast<double>(b3d_sz) / static_cast<double>(raw_sz);
+    std::cout << "\n" << std::string(70, '=') << "\n"
+              << "  SUMMARY -- " << ds_name << "\n"
+              << std::string(70, '=') << "\n"
+              << "  Storage:   " << size_str(b3d_sz) << " / " << size_str(raw_sz)
+              << " = " << std::fixed << std::setprecision(3) << ratio << "x\n"
+              << "  Outputs:   " << run_dir.string() << "\n"
+              << std::string(70, '=') << "\n\n";
     return 0;
 }
 
 // ── Main ─────────────────────────────────────────────────────────────
+
+static void print_usage(const char* exe) {
+    std::cout << "Usage: " << exe << " [options]\n"
+              << "  --datasets NAME [NAME ...]\n"
+              << "  --axis x|y|z|all --mode random|sequential|all\n"
+              << "  --random-count N --seq-count N --seq-start N --seed N\n"
+              << "  --cache-mode cold|hot|both\n"
+              << "  --cold-method scrub|none --cold-scrub-file FILE\n"
+              << "  --cold-scrub-ratio R --cold-scrub-passes N --cold-settle-ms N\n"
+              << "  --cold-isolation suite|case --warmup-scope dataset|workload\n"
+              << "  --warm-up (compatibility alias for --cache-mode hot)\n"
+              << "  --warmup-stride N --warmup-memory MB\n"
+              << "  --output-dir DIR --no-output-sync --no-log\n"
+              << "  --verify --verify-samples N --dim-x N --dim-y N --dim-z N\n";
+}
 
 int main(int argc, char* argv[]) {
     std::vector<std::string> datasets;
@@ -708,6 +916,8 @@ int main(int argc, char* argv[]) {
     bool verify_enabled = false;   // default: do NOT pollute cache
     bool no_log = false;
     bool warm_up = false;
+    bool cache_mode_explicit = false;
+    CacheOptions cache_options;
     int warmup_stride_val = 4096;
     int warmup_memory_mb = 0;
     uint32_t seed = 42;
@@ -751,8 +961,40 @@ int main(int argc, char* argv[]) {
             mode_arg = argv[++i];
         } else if (arg == "--no-log") {
             no_log = true;
+        } else if (arg == "--help" || arg == "-h") {
+            print_usage(argv[0]);
+            return 0;
         } else if (arg == "--warm-up") {
             warm_up = true;
+        } else if (arg == "--cache-mode" && i + 1 < argc) {
+            cache_mode_explicit = true;
+            if (!parse_cache_mode(argv[++i], cache_options.mode)) {
+                std::cerr << "[ERROR] invalid --cache-mode: must be cold|hot|both\n";
+                return 2;
+            }
+        } else if (arg == "--cold-method" && i + 1 < argc) {
+            if (!parse_cold_method(argv[++i], cache_options.cold_method)) {
+                std::cerr << "[ERROR] invalid --cold-method: must be scrub|none\n";
+                return 2;
+            }
+        } else if (arg == "--cold-scrub-file" && i + 1 < argc) {
+            cache_options.cold_scrub_file = argv[++i];
+        } else if (arg == "--cold-scrub-ratio" && i + 1 < argc) {
+            cache_options.cold_scrub_ratio = std::strtod(argv[++i], nullptr);
+        } else if (arg == "--cold-scrub-passes" && i + 1 < argc) {
+            cache_options.cold_scrub_passes = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        } else if (arg == "--cold-settle-ms" && i + 1 < argc) {
+            cache_options.cold_settle_ms = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        } else if (arg == "--cold-isolation" && i + 1 < argc) {
+            if (!parse_cold_isolation(argv[++i], cache_options.cold_isolation)) {
+                std::cerr << "[ERROR] invalid --cold-isolation: must be suite|case\n";
+                return 2;
+            }
+        } else if (arg == "--warmup-scope" && i + 1 < argc) {
+            if (!parse_warmup_scope(argv[++i], cache_options.warmup_scope)) {
+                std::cerr << "[ERROR] invalid --warmup-scope: must be dataset|workload\n";
+                return 2;
+            }
         } else if (arg == "--warmup-stride" && i + 1 < argc) {
             warmup_stride_val = std::atoi(argv[++i]);
         } else if (arg == "--warmup-memory" && i + 1 < argc) {
@@ -763,10 +1005,21 @@ int main(int argc, char* argv[]) {
             custom_dy = std::strtoull(argv[++i], nullptr, 10);
         } else if (arg == "--dim-z" && i + 1 < argc) {
             custom_dz = std::strtoull(argv[++i], nullptr, 10);
+        } else {
+            std::cerr << "[ERROR] unknown or incomplete argument: " << arg << "\n";
+            print_usage(argv[0]);
+            return 2;
         }
     }
 
     if (datasets.empty()) datasets = {"test18", "test50"};
+    if (warm_up) {
+        if (cache_mode_explicit && cache_options.mode != CacheMode::Hot) {
+            std::cerr << "[ERROR] --warm-up is a compatibility alias for --cache-mode hot and conflicts with cold/both\n";
+            return 2;
+        }
+        cache_options.mode = CacheMode::Hot;
+    }
 
     // ── Strict parameter validation (fail fast, non-zero) ────────────
     // block_size == 0 means auto-detect; resolved per-dataset in run_full_test.
@@ -789,9 +1042,23 @@ int main(int argc, char* argv[]) {
                   << warmup_memory_mb << ")\n";
         return 2;
     }
-    if (warm_up && warmup_stride_val < 1) {
+    if (cache_mode_has_hot(cache_options.mode) && warmup_stride_val < 1) {
         std::cerr << "[ERROR] --warmup-stride must be >= 1 when warming up (got "
                   << warmup_stride_val << ")\n";
+        return 2;
+    }
+    if (cache_options.cold_scrub_ratio <= 0.0) {
+        std::cerr << "[ERROR] --cold-scrub-ratio must be > 0\n";
+        return 2;
+    }
+    if (cache_options.cold_scrub_passes == 0) {
+        std::cerr << "[ERROR] --cold-scrub-passes must be > 0\n";
+        return 2;
+    }
+    if (cache_mode_has_cold(cache_options.mode) &&
+        cache_options.cold_method == ColdMethod::Scrub &&
+        cache_options.cold_scrub_file.empty()) {
+        std::cerr << "[ERROR] --cold-scrub-file is required when cold scrub is enabled\n";
         return 2;
     }
 
@@ -867,83 +1134,18 @@ int main(int argc, char* argv[]) {
     // Logging
     if (!no_log) setup_logging(datasets);
 
-    // ── Run-wide notices ─────────────────────────────────────────────
-    std::cout << "[CACHE-NOTE] This tool does NOT clear the OS page cache or "
-                 "device caches.\n"
-              << "            Cold-cache measurement is an EXTERNAL precondition: "
-                 "an administrator\n"
-              << "            or test harness must clear the OS page cache (and verify "
-                 "physical disk\n"
-              << "            reads) BEFORE running. Without that, results reflect "
-                 "whatever cached\n"
-              << "            state the OS/device currently holds.\n";
-
-    std::cout << "\n[OUTPUT-SYNC] output_sync="
+    // Run-wide notices
+    std::cout << "CACHE_CONFIG mode=" << to_string(cache_options.mode)
+              << " cold_method=" << to_string(cache_options.cold_method)
+              << " cold_isolation=" << to_string(cache_options.cold_isolation)
+              << " warmup_scope=" << to_string(cache_options.warmup_scope)
+              << " timing_scope=read_write_total\n";
+    std::cout << "[OUTPUT-SYNC] output_sync="
               << (output_sync ? "requested" : "disabled") << "\n";
-    if (output_sync) {
-        std::cout << "   requested (default): after fflush, "
-#ifdef _WIN32
-                  << "_commit"
-#else
-                  << "fsync"
-#endif
-                  << " is issued per output file. Timing covers slice read +\n"
-                  << "   file create + write + close + sync. This does NOT guarantee "
-                     "bypassing the\n"
-                  << "   device firmware write cache.\n";
-    } else {
-        std::cout << "   disabled (--no-output-sync): data is committed to the OS only; "
-                     "this is a\n"
-                  << "   diagnostic mode and is NOT a durable/persisted result. The "
-                     "device firmware\n"
-                  << "   cache is NOT bypassed.\n";
-    }
-
-    // Case plan + caching implications.
-    {
-        std::cout << "\n[CASE-PLAN] axis=" << axis_arg << " mode=" << mode_arg << "\n";
-        bool all_axes = (sel_axes.size() == 3);
-        bool all_modes = (sel_modes.size() == 2);
-        if (all_axes || all_modes) {
-            std::cout << "   Cases run sequentially in this single process. The OS "
-                         "page cache state\n"
-                      << "   evolves across cases, so these are NOT independent "
-                         "cold-cache results.\n"
-                      << "   For cold-cache reference numbers, externally clear the "
-                         "cache and run a\n"
-                      << "   single --axis + single --mode in a separate process.\n";
-        } else {
-            std::cout << "   A reduced case set runs in this process (one axis, one "
-                         "mode). Cache state\n"
-                      << "   still depends on prior activity in this process (e.g. "
-                         "--verify/--warm-up)\n"
-                      << "   and is NOT cleared by this tool.\n";
-        }
-    }
-
-    if (verify_enabled) {
-        std::cout << "\n[VERIFY-MODE] *** --verify ENABLED ***\n"
-                  << "   This process will read the RAW input file for verification, "
-                     "populating the OS\n"
-                  << "   page cache. Benchmark numbers in THIS process are NOT "
-                     "cold-cache results.\n"
-                  << "   Use --verify for correctness checking only; the default is to "
-                     "skip verify.\n";
-    } else {
-        std::cout << "\n[VERIFY-MODE] verify=skipped (default). Benchmark cases do not "
-                     "read the raw input\n"
-                  << "   in this process; cold-cache remains an external precondition.\n";
-    }
-
-    if (warm_up) {
-        std::cout << "\n!!! ================ WARM-CACHE DIAGNOSTIC ================ !!!\n"
-                  << "!!! --warm-up is ENABLED for this run. Benchmark numbers  !!!\n"
-                  << "!!! below reflect a WARM OS page cache and are NOT        !!!\n"
-                  << "!!! cold-cache performance numbers. Use only for hot-cache !!!\n"
-                  << "!!! diagnostics.                                          !!!\n"
-                  << "!!! ============== END WARM-CACHE DIAGNOSTIC ============= !!!\n";
-    }
-    std::cout << "\n";
+    std::cout << "[CASE-PLAN] axis=" << axis_arg << " mode=" << mode_arg
+              << " cold_isolation=" << to_string(cache_options.cold_isolation) << "\n";
+    std::cout << "[VERIFY-MODE] verify="
+              << (verify_enabled ? "enabled" : "skipped") << "\n\n";
 
     // Create the shared run directory now (unique id guarantees no reuse).
     {
@@ -995,7 +1197,7 @@ int main(int argc, char* argv[]) {
         ret = run_full_test(ds_name, cfg, block_size,
                             random_count, seq_count,
                             verify_enabled, verify_samples,
-                            warm_up,
+                            cache_options,
                             static_cast<size_t>(warmup_stride_val),
                             static_cast<uint64_t>(warmup_memory_mb),
                             seed,

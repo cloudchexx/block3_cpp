@@ -28,6 +28,10 @@ MappedFile(raw)
 
 CLI 层（`cli.cpp` 和 `run_test.cpp`）在未显式指定 `--block-size` 时默认调用 `detect_storage_medium()` + `auto_block_size()`，根据实际硬件自适应选择块大小。
 
+### `benchmark_cache.cpp`
+
+提供 benchmark 私有缓存实验支持：解析/表示 `cache-mode`、`cold-method`、`cold-isolation`、`warmup-scope`，查询页面大小和物理内存，计算 scrub 默认容量，创建确定性伪随机 scrub 文件，并用普通 buffered I/O 逐页触碰 scrub 文件生成 `cold_scrubbed`。该模块供 `block3d_cli bench` 和 `run_test` 共用。
+
 ### `reader.cpp`
 
 #### `MappedFile`
@@ -60,7 +64,7 @@ read_*_slice()
 - `read_subvolume()`：遍历相交块并复制连续 Z 段；区间为半开区间。
 - `read_full_volume()`：完整范围的 `read_subvolume()`。
 - `verify()`：固定随机坐标，多线程对照原始 `.dat`。
-- `warm_up()`：同步或异步预热 OS 页缓存。
+- `warm_up()`：同步或异步预热 OS 页缓存；OS 预取提示后会实际触碰 stride 页和末字节再完成。
 
 ## 可执行文件
 
@@ -70,7 +74,8 @@ read_*_slice()
 |---|---|
 | `convert` | `convert_raw_to_blocked()` |
 | `info` | reader 元数据和存储比例 |
-| `bench` | 三轴 `read_slices_batch()`，不写结果 |
+| `cache-prepare` | 创建可复用冷缓存 scrub 文件 |
+| `bench` | 固定计划三轴 `read_slices_batch()`，支持 cold/hot/both 缓存阶段，不写结果 |
 | `verify` | `BlockedFileReader::verify()` |
 | `extract` | 单切片或单列写无头 float32 |
 
@@ -81,11 +86,14 @@ read_*_slice()
 面向 `test18`、`test50` 及自定义数据集的综合性能工具：
 
 - 定位数据文件和复用有效 `.b3d`（含 block_size 校验）；
-- 可选转换、自动 block_size 探测、随机点校验和 warm-up；
-- 生成随机/连续切片请求；
-- 读取并把每张切片写盘；
-- 可选 `fflush` + `_commit/fsync`；
-- 输出吞吐、平均时间、轴平衡、存储比例和日志；
+- 可选转换、自动 block_size 探测和随机点校验；
+- 支持 `--cache-mode cold|hot|both`、`--cold-method scrub|none`、`--cold-isolation suite|case`、`--warmup-scope dataset|workload`；
+- 生成一次固定随机/连续切片请求计划并输出 `PLAN_HASH`，cold/hot 复用同一计划；
+- cold 阶段可逐页读取 scrub 文件生成 `cold_scrubbed`，hot 阶段显式 warm-up 后生成 `hot_prefetched`；
+- 输出 read/write/total 拆分时间，主指标仍是含写盘的 total；
+- 读取并把每张切片写入独立 phase 目录，支持可选 `fflush` + `_commit/fsync`；
+- `both` 模式输出 `BENCHMARK_COMPARE` 并逐文件校验 cold/hot 结果一致；
+- 默认保存控制台日志到当前工作目录 `logs/`，包括 stdout/stderr；
 - 支持自定义数据集：`--datasets <name> --dim-x N --dim-y N --dim-z N`，文件自动映射为 `<name>.dat` / `<name>.b3d`。
 
 其计时包含切片结果写盘，不包含 reader 构造和 mmap。

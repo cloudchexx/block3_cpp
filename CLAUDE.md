@@ -36,6 +36,13 @@ ctest --test-dir build -C Release -R '^test_block3d$' --output-on-failure
 ctest --test-dir build -C Release -R '^test_cli$' --output-on-failure
 ```
 
+准备本地冷缓存 scrub 文件与冷/热 benchmark：
+
+```bash
+build/Release/block3d_cli cache-prepare SCRUB.bin --size auto --cold-scrub-ratio 1.5
+build/Release/block3d_cli bench DATA.b3d --cache-mode both --cold-method scrub --cold-scrub-file SCRUB.bin --warmup-scope workload
+```
+
 只构建某个目标：
 
 ```bash
@@ -79,6 +86,18 @@ BlockedFileReader
 - 性能结果依赖 OS 页缓存。描述或比较数据时必须说明冷缓存、转换后缓存、验证后缓存或显式 warm-up 状态。
 - Python 生成器默认写 `3DDF` 自定义头；只有 CLI `--no-header` 生成的文件可直接交给 C++ 转换器。
 
+## 冷/热缓存 benchmark
+
+- `block3d_cli cache-prepare` 只负责一次性创建可复用 scrub 文件，不在 benchmark 开始前自动生成大文件。
+- `block3d_cli bench` 和 `run_test` 都支持 `--cache-mode cold|hot|both`，默认 `both`；`--warm-up` 是兼容旧脚本的 `--cache-mode hot` 别名，不能与 `cold/both` 同时使用。
+- cold 阶段默认 `--cold-method scrub`，必须显式提供 `--cold-scrub-file`；scrub 失败、文件不存在或容量不足时不能降级为 `cold_first_touch`。
+- 临时/兼容测试可使用 `--cold-method none`，输出状态为 `cold_first_touch`，不得把它描述成本项目标准冷缓存成绩。
+- `--cold-isolation suite` 表示 scrub 一次后跑完整套计划；`case` 表示每个 axis/mode case 前重新 scrub。
+- `--warmup-scope dataset|workload` 分别表示预热整个数据区或固定请求计划会访问的工作集。
+- `block3d_cli bench` 的计时范围是 `read_only`；`run_test` 的计时范围是 `read_write_total`，主指标 `total_sec` 包含读取、文件创建/写入/关闭及可选 `_commit`/`fsync`。
+- 两个入口都输出固定 `PLAN_HASH`，确保 cold/hot 使用同一请求计划。`run_test both` 还会预估输出空间、创建独立的 `cold_scrubbed/` 与 `hot_prefetched/` 目录，并逐文件校验两阶段输出一致。
+- `run_test` 默认把控制台输出（包括错误）保存到当前工作目录的 `logs/`；`--no-log` 仅用于明确不需要日志的临时运行。
+
 ## 自适应块大小与存储检测
 
 - `convert` 默认不再固定 block_size=32。未指定 `--block-size` 时，程序会在输出目录执行 5 轮 1MiB 写入+fsync 探测，根据中位延迟将存储分类为 HDD / SSD / NVMe / Unknown。
@@ -92,14 +111,14 @@ BlockedFileReader
 
 ## 预热
 
-- 两个 benchmark 入口（`block3d_cli bench` 和 `run_test`）均支持 `--warm-up`。该选项在计时开始前将全部数据区顺序加载到 OS 页缓存中。
-- 预热使用 `PrefetchVirtualMemory`（Windows）/ `madvise(MADV_WILLNEED)`（Linux），并在不支持时回退到手动页触摸。
+- 两个 benchmark 入口（`block3d_cli bench` 和 `run_test`）均支持 `--warm-up`，统一作为只执行 hot phase 的兼容别名；显式新命令优先使用 `--cache-mode hot`。
+- 预热使用 `PrefetchVirtualMemory`（Windows）/ `madvise(MADV_WILLNEED)`（Linux）作为提示，然后实际触碰目标范围 stride 页面和最后一个字节；完成后才视为 warm-up done。
 - 预热后的 benchmark 结果是热缓存数据——仅供诊断，并非冷缓存性能基准。
 
 ## 修改后的验证范围
 
 - 修改格式、布局、转换或 reader：运行 `test_block3d` 和 `test_cli`。
-- 修改 CLI 参数或错误处理：至少运行 `test_cli`。
+- 修改 CLI 参数、cache-prepare、bench phase 输出或错误处理：至少运行 `test_cli`。
 - 修改并发缓存逻辑：必须覆盖 `test_concurrent_adjacent_same_block_key` 所在的完整 `test_block3d`。
 - 修改性能路径时，不要用 `run_test` 替代正确性测试；大数据测试需要本地数据集和大量磁盘空间。
 
