@@ -24,6 +24,8 @@ static void print_usage(const char* prog) {
     std::cerr << "  " << prog << " info <file>\n";
     std::cerr << "  " << prog << " cache-prepare <file> --size auto|N[GB] [--cold-scrub-ratio R] [--overwrite]\n";
     std::cerr << "  " << prog << " bench <file> [--num-reads N] [--random] [--threads N] [--memory-limit N]\n";
+    std::cerr << "         [--batch-read legacy|fused] [--batch-window N]\n";
+    std::cerr << "         [--pipeline off] [--read-dispatch round-robin|contiguous]\n";
     std::cerr << "         [--cache-mode cold|hot|both] [--warm-up]\n";
     std::cerr << "         [--cold-method scrub|none] [--cold-scrub-file FILE] [--cold-scrub-ratio R]\n";
     std::cerr << "         [--cold-scrub-passes N] [--cold-settle-ms N] [--cold-isolation suite|case]\n";
@@ -67,6 +69,16 @@ static uint64_t axis_dim(const BlockedFileReader& reader, char axis) {
     if (axis == 'y') return reader.dim_y();
     if (axis == 'z') return reader.dim_z();
     throw std::invalid_argument("Unknown axis: " + str_axis(axis));
+}
+
+static std::string normalize_dispatch(const std::string& value) {
+    return value == "round-robin" ? "round_robin" : value;
+}
+
+static ReadDispatchStrategy parse_dispatch_strategy(const std::string& value) {
+    return value == "contiguous"
+        ? ReadDispatchStrategy::Contiguous
+        : ReadDispatchStrategy::RoundRobin;
 }
 
 static std::string hex_u64(uint64_t value) {
@@ -276,10 +288,27 @@ static BenchPhaseResult run_read_phase(const char* path,
                                        const BenchCasePlan& plan,
                                        const std::string& cache_name,
                                        int threads,
-                                       uint64_t mem_mb) {
-    BlockedFileReader reader(path, threads, mem_mb);
+                                       uint64_t mem_mb,
+                                       const std::string& batch_read,
+                                       size_t batch_window_slices,
+                                       ReadDispatchStrategy dispatch_strategy) {
+    BlockedFileReader reader(path, threads, mem_mb, dispatch_strategy);
     auto t0 = std::chrono::high_resolution_clock::now();
-    auto slices = reader.read_slices_batch(plan.axis, plan.indices, threads);
+    std::vector<std::vector<float>> slices;
+    if (batch_read == "legacy") {
+        for (uint64_t index : plan.indices) {
+            slices.push_back(reader.read_slice(plan.axis, index));
+        }
+    } else {
+        SliceBatchOptions options;
+        options.num_threads = threads;
+        options.window_slices = batch_window_slices;
+        slices.resize(plan.indices.size());
+        reader.read_slices_batch_stream(plan.axis, plan.indices, options,
+            [&](size_t request_pos, uint64_t, std::vector<float>&& slice) {
+                slices[request_pos] = std::move(slice);
+            });
+    }
     auto t1 = std::chrono::high_resolution_clock::now();
     BenchPhaseResult result;
     result.cache = cache_name;
@@ -298,6 +327,9 @@ static BenchPhaseResult run_read_phase(const char* path,
               << " avg_ms=" << result.avg_ms
               << " slices_per_sec=" << result.throughput
               << " count=" << result.count
+              << " reader_pool_workers=" << reader.thread_pool_workers()
+              << " reader_pool_jobs=" << reader.thread_pool_jobs()
+              << " reader_pool_serial_fallbacks=" << reader.thread_pool_serial_fallbacks()
               << " plan_hash=" << hex_u64(plan.plan_hash) << "\n";
     std::cout << "  " << (plan.random_mode ? "Random" : "Sequential") << " "
               << static_cast<char>(std::toupper(static_cast<unsigned char>(plan.axis)))
@@ -311,19 +343,37 @@ static void warm_up_for_plans(const char* path,
                               const std::vector<BenchCasePlan>& plans,
                               WarmupScope scope,
                               int threads,
-                              uint64_t mem_mb) {
+                              uint64_t mem_mb,
+                              const std::string& batch_read,
+                              size_t batch_window_slices,
+                              ReadDispatchStrategy dispatch_strategy) {
     auto t0 = std::chrono::high_resolution_clock::now();
     uint64_t logical_bytes = 0;
     uint64_t checksum = 0;
     {
-        BlockedFileReader reader(path, threads, mem_mb);
+        BlockedFileReader reader(path, threads, mem_mb, dispatch_strategy);
         if (scope == WarmupScope::Dataset) {
             uint64_t bs = reader.block_size();
             logical_bytes = reader.total_blocks() * bs * bs * bs * sizeof(float);
             reader.warm_up(false, query_system_page_size(), mem_mb);
         } else {
             for (const auto& plan : plans) {
-                auto slices = reader.read_slices_batch(plan.axis, plan.indices, threads);
+                std::vector<std::vector<float>> slices;
+                if (batch_read == "legacy") {
+                    slices.reserve(plan.indices.size());
+                    for (uint64_t index : plan.indices) {
+                        slices.push_back(reader.read_slice(plan.axis, index));
+                    }
+                } else {
+                    SliceBatchOptions options;
+                    options.num_threads = threads;
+                    options.window_slices = batch_window_slices;
+                    slices.resize(plan.indices.size());
+                    reader.read_slices_batch_stream(plan.axis, plan.indices, options,
+                        [&](size_t request_pos, uint64_t, std::vector<float>&& slice) {
+                            slices[request_pos] = std::move(slice);
+                        });
+                }
                 for (const auto& slice : slices) {
                     logical_bytes += slice.size() * sizeof(float);
                     if (!slice.empty()) {
@@ -375,11 +425,34 @@ static int cmd_bench(int argc, char* argv[]) {
     int nt = get_arg_int(argc, argv, "--threads", 0);
     uint64_t mem_mb = get_arg_uint64(argc, argv, "--memory-limit", 0);
     bool warm_up_flag = has_arg(argc, argv, "--warm-up");
+    std::string batch_read = get_arg(argc, argv, "--batch-read", "fused");
+    int batch_window_arg = get_arg_int(argc, argv, "--batch-window", 4);
+    std::string pipeline = get_arg(argc, argv, "--pipeline", "off");
+    std::string read_dispatch = get_arg(argc, argv, "--read-dispatch", "round-robin");
 
     if (num_reads <= 0) {
         std::cerr << "--num-reads must be > 0\n";
         return 1;
     }
+    if (batch_read != "legacy" && batch_read != "fused") {
+        std::cerr << "Invalid --batch-read: " << batch_read << " (must be legacy|fused)\n";
+        return 1;
+    }
+    if (batch_window_arg <= 0) {
+        std::cerr << "--batch-window must be > 0\n";
+        return 1;
+    }
+    if (pipeline != "off") {
+        std::cerr << "Invalid --pipeline for read-only bench: " << pipeline
+                  << " (only off is supported; use run_test for write pipeline benchmarking)\n";
+        return 1;
+    }
+    if (read_dispatch != "round-robin" && read_dispatch != "contiguous") {
+        std::cerr << "Invalid --read-dispatch: " << read_dispatch
+                  << " (must be round-robin|contiguous)\n";
+        return 1;
+    }
+    ReadDispatchStrategy dispatch_strategy = parse_dispatch_strategy(read_dispatch);
 
     CacheOptions cache_options;
     if (const char* s = get_arg(argc, argv, "--cache-mode", nullptr)) {
@@ -448,6 +521,11 @@ static int cmd_bench(int argc, char* argv[]) {
               << " cold_isolation=" << to_string(cache_options.cold_isolation)
               << " warmup_scope=" << to_string(cache_options.warmup_scope)
               << " timing_scope=read_only\n";
+    std::cout << "BATCH_READ mode=" << batch_read
+              << " window_slices=" << batch_window_arg << "\n";
+    std::cout << "PIPELINE mode=" << pipeline
+              << " buffer_mb=0 window_slices=0 queue_slices=0 writer_threads=0\n";
+    std::cout << "READ_DISPATCH strategy=" << normalize_dispatch(read_dispatch) << "\n";
     std::cout << "TIMING_SCOPE value=read_only\n";
     std::cout << "PLAN_HASH_SUITE value=";
     uint64_t suite_hash = 1469598103934665603ULL;
@@ -473,24 +551,28 @@ static int cmd_bench(int argc, char* argv[]) {
             for (const auto& plan : plans) {
                 cold_results.push_back(run_read_phase(path, plan,
                     cache_options.cold_method == ColdMethod::Scrub ? "cold_scrubbed" : "cold_first_touch",
-                    nt, mem_mb));
+                    nt, mem_mb, batch_read, static_cast<size_t>(batch_window_arg),
+                    dispatch_strategy));
             }
         } else {
             for (const auto& plan : plans) {
                 if (!do_scrub_if_needed(cache_options)) return 1;
                 cold_results.push_back(run_read_phase(path, plan,
                     cache_options.cold_method == ColdMethod::Scrub ? "cold_scrubbed" : "cold_first_touch",
-                    nt, mem_mb));
+                    nt, mem_mb, batch_read, static_cast<size_t>(batch_window_arg),
+                    dispatch_strategy));
             }
         }
     }
 
     if (cache_mode_has_hot(cache_options.mode)) {
         std::cout << "\n[Phase] Warm-up\n";
-        warm_up_for_plans(path, plans, cache_options.warmup_scope, nt, mem_mb);
+        warm_up_for_plans(path, plans, cache_options.warmup_scope, nt, mem_mb,
+                          batch_read, static_cast<size_t>(batch_window_arg),
+                          dispatch_strategy);
         std::cout << "CACHE_PHASE name=hot_prefetched\n";
         for (const auto& plan : plans) {
-            hot_results.push_back(run_read_phase(path, plan, "hot_prefetched", nt, mem_mb));
+            hot_results.push_back(run_read_phase(path, plan, "hot_prefetched", nt, mem_mb, batch_read, static_cast<size_t>(batch_window_arg), dispatch_strategy));
         }
     }
 

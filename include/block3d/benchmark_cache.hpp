@@ -15,7 +15,7 @@ struct CacheOptions {
     CacheMode mode = CacheMode::Both;
     ColdMethod cold_method = ColdMethod::Scrub;
     ColdIsolation cold_isolation = ColdIsolation::Suite;
-    WarmupScope warmup_scope = WarmupScope::Dataset;
+    WarmupScope warmup_scope = WarmupScope::Workload;
     std::string cold_scrub_file;
     double cold_scrub_ratio = 1.50;
     uint32_t cold_scrub_passes = 1;

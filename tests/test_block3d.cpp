@@ -11,6 +11,7 @@
 #include <vector>
 #include <random>
 #include <thread>
+#include <string>
 #include <atomic>
 
 namespace fs = std::filesystem;
@@ -397,11 +398,21 @@ static int test_verify() {
 }
 
 static int test_batch_read() {
-    std::cout << "  Batch slice read (thread safety)...";
+    std::cout << "  Batch slice read (element correctness)...";
 
-    uint64_t dx = 32, dy = 32, dz = 32;
+    uint64_t dx = 19, dy = 21, dz = 23;
+    uint64_t bs = 8;
     uint64_t total = dx * dy * dz;
-    std::vector<float> raw_data(total, 1.0f);
+    std::vector<float> raw_data(total);
+    for (uint64_t x = 0; x < dx; x++)
+        for (uint64_t y = 0; y < dy; y++)
+            for (uint64_t z = 0; z < dz; z++)
+                raw_data[x * dy * dz + y * dz + z] =
+                    static_cast<float>(x * 1000000 + y * 1000 + z);
+
+    auto at = [&](uint64_t x, uint64_t y, uint64_t z) -> float {
+        return raw_data[x * dy * dz + y * dz + z];
+    };
 
     fs::path tmp = fs::temp_directory_path() / "block3d_test";
     fs::path raw_path = tmp / "test_batch_raw.dat";
@@ -414,16 +425,137 @@ static int test_batch_read() {
     }
 
     convert_raw_to_blocked(raw_path.string(), b3d_path.string(),
-                           dx, dy, dz, 8, 4, false);
+                           dx, dy, dz, bs, 4, false);
 
     BlockedFileReader reader(b3d_path.string());
-    std::vector<uint64_t> indices = {0, 5, 10, 15, 20, 25, 30};
 
-    for (char axis : {'x', 'y', 'z'}) {
+    auto check_batch = [&](char axis,
+                           const std::vector<uint64_t>& indices,
+                           const char* label) -> bool {
         auto slices = reader.read_slices_batch(axis, indices, 4);
         if (slices.size() != indices.size()) {
-            std::cerr << "FAIL batch count for " << axis << "\n"; return 1;
+            std::cerr << "FAIL batch count axis=" << axis << " case=" << label << "\n";
+            return false;
         }
+        for (size_t i = 0; i < indices.size(); i++) {
+            uint64_t idx = indices[i];
+            const auto& sl = slices[i];
+            if (axis == 'x') {
+                if (sl.size() != dy * dz) {
+                    std::cerr << "FAIL x size case=" << label << "\n"; return false;
+                }
+                for (uint64_t y = 0; y < dy; y++)
+                    for (uint64_t z = 0; z < dz; z++)
+                        if (std::abs(sl[y * dz + z] - at(idx, y, z)) > 1e-6f) {
+                            std::cerr << "FAIL x value case=" << label
+                                      << " request=" << i << " idx=" << idx << "\n";
+                            return false;
+                        }
+            } else if (axis == 'y') {
+                if (sl.size() != dx * dz) {
+                    std::cerr << "FAIL y size case=" << label << "\n"; return false;
+                }
+                for (uint64_t x = 0; x < dx; x++)
+                    for (uint64_t z = 0; z < dz; z++)
+                        if (std::abs(sl[x * dz + z] - at(x, idx, z)) > 1e-6f) {
+                            std::cerr << "FAIL y value case=" << label
+                                      << " request=" << i << " idx=" << idx << "\n";
+                            return false;
+                        }
+            } else if (axis == 'z') {
+                if (sl.size() != dx * dy) {
+                    std::cerr << "FAIL z size case=" << label << "\n"; return false;
+                }
+                for (uint64_t x = 0; x < dx; x++)
+                    for (uint64_t y = 0; y < dy; y++)
+                        if (std::abs(sl[x * dy + y] - at(x, y, idx)) > 1e-6f) {
+                            std::cerr << "FAIL z value case=" << label
+                                      << " request=" << i << " idx=" << idx << "\n";
+                            return false;
+                        }
+            } else {
+                std::cerr << "FAIL unexpected axis in test\n";
+                return false;
+            }
+        }
+        return true;
+    };
+
+    const std::vector<std::pair<const char*, std::vector<uint64_t>>> cases = {
+        {"same-layer", {0, 1, 2, 7}},
+        {"cross-layer", {0, 7, 8, 9, 15, 16}},
+        {"duplicate-out-of-order", {7, 0, 7, 2}},
+        {"edge", {0, 7, 8}},
+        {"empty", {}}
+    };
+
+    for (char axis : {'x', 'y', 'z'}) {
+        uint64_t dim = axis == 'x' ? dx : axis == 'y' ? dy : dz;
+        for (const auto& tc : cases) {
+            auto indices = tc.second;
+            if (std::string(tc.first) == "edge") indices = {0, dim - 1};
+            if (!check_batch(axis, indices, tc.first)) return 1;
+        }
+
+        std::vector<uint64_t> stream_indices = {8, 0, 7, 8, dim - 1};
+        SliceBatchOptions options;
+        options.num_threads = 4;
+        options.window_slices = 3;
+        std::vector<std::vector<float>> streamed(stream_indices.size());
+        std::vector<size_t> completion_order;
+        reader.read_slices_batch_stream(axis, stream_indices, options,
+            [&](size_t request_pos, uint64_t index, std::vector<float>&& slice) {
+                if (request_pos >= stream_indices.size() || index != stream_indices[request_pos]) {
+                    std::cerr << "FAIL stream request metadata axis=" << axis << "\n";
+                    return;
+                }
+                completion_order.push_back(request_pos);
+                streamed[request_pos] = std::move(slice);
+            });
+        if (completion_order.size() != stream_indices.size()) {
+            std::cerr << "FAIL stream completion count axis=" << axis << "\n";
+            return 1;
+        }
+        for (size_t i = 0; i < stream_indices.size(); i++) {
+            auto expected = reader.read_slice(axis, stream_indices[i]);
+            if (!allclose(streamed[i], expected)) {
+                std::cerr << "FAIL stream value axis=" << axis << " request=" << i << "\n";
+                return 1;
+            }
+        }
+        if (!streamed[0].empty() && !streamed[3].empty()) {
+            float before = streamed[3][0];
+            streamed[0][0] = before + 123.0f;
+            if (streamed[3][0] != before) {
+                std::cerr << "FAIL duplicate stream buffers share storage axis=" << axis << "\n";
+                return 1;
+            }
+        }
+    }
+
+    try {
+        (void)reader.read_slices_batch('q', {0}, 4);
+        std::cerr << "FAIL invalid axis did not throw\n";
+        return 1;
+    } catch (const std::invalid_argument&) {
+    }
+    try {
+        (void)reader.read_slices_batch('x', {0, dx}, 4);
+        std::cerr << "FAIL out-of-range x did not throw\n";
+        return 1;
+    } catch (const std::out_of_range&) {
+    }
+    try {
+        (void)reader.read_slices_batch('y', {dy}, 4);
+        std::cerr << "FAIL out-of-range y did not throw\n";
+        return 1;
+    } catch (const std::out_of_range&) {
+    }
+    try {
+        (void)reader.read_slices_batch('z', {dz}, 4);
+        std::cerr << "FAIL out-of-range z did not throw\n";
+        return 1;
+    } catch (const std::out_of_range&) {
     }
 
     std::cout << "PASS\n";
@@ -559,6 +691,139 @@ static int test_concurrent_adjacent_same_block_key() {
         for (auto& th : ths) th.join();
         if (errs.load() != 0) {
             std::cerr << "FAIL mixed-axis hammer: " << errs.load() << " errors\n";
+            return 1;
+        }
+    }
+
+    std::cout << "PASS\n";
+    return 0;
+}
+
+static int test_reader_thread_pool_lifecycle() {
+    std::cout << "  Reader persistent thread pool lifecycle...";
+
+    uint64_t dx = 80, dy = 72, dz = 64;
+    uint64_t bs = 8;
+    uint64_t total = dx * dy * dz;
+    std::vector<float> raw_data(total);
+    for (uint64_t x = 0; x < dx; x++)
+        for (uint64_t y = 0; y < dy; y++)
+            for (uint64_t z = 0; z < dz; z++)
+                raw_data[x * dy * dz + y * dz + z] =
+                    static_cast<float>(x * 1000000 + y * 1000 + z);
+
+    fs::path tmp = fs::temp_directory_path() / "block3d_test";
+    fs::path raw_path = tmp / "test_pool_raw.dat";
+    fs::path b3d_path = tmp / "test_pool.b3d";
+
+    {
+        std::ofstream f(raw_path, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(raw_data.data()),
+                raw_data.size() * sizeof(float));
+    }
+    convert_raw_to_blocked(raw_path.string(), b3d_path.string(),
+                           dx, dy, dz, bs, 4, false);
+
+    BlockedFileReader serial_reader(b3d_path.string(), 1);
+    const std::vector<char> axes = {'x', 'y', 'z'};
+    const std::vector<uint64_t> x_indices = {0, 7, 8, dx - 1};
+    const std::vector<uint64_t> y_indices = {0, 7, 8, dy - 1};
+    const std::vector<uint64_t> z_indices = {0, 7, 8, dz - 1};
+
+    auto indices_for = [&](char axis) -> const std::vector<uint64_t>& {
+        if (axis == 'x') return x_indices;
+        if (axis == 'y') return y_indices;
+        return z_indices;
+    };
+
+    for (int workers : {1, 2, 4, 16}) {
+        for (ReadDispatchStrategy strategy : {ReadDispatchStrategy::RoundRobin,
+                                             ReadDispatchStrategy::Contiguous}) {
+            BlockedFileReader reader(b3d_path.string(), workers, 0, strategy);
+            if (reader.read_dispatch_strategy() != strategy) {
+                std::cerr << "FAIL dispatch strategy getter workers=" << workers << "\n";
+                return 1;
+            }
+            if (workers > 1 && reader.thread_pool_workers() != static_cast<size_t>(workers)) {
+                std::cerr << "FAIL pool worker count workers=" << workers
+                          << " got=" << reader.thread_pool_workers() << "\n";
+                return 1;
+            }
+            for (char axis : axes) {
+                for (uint64_t index : indices_for(axis)) {
+                    auto expected = serial_reader.read_slice(axis, index);
+                    auto got = reader.read_slice(axis, index);
+                    if (!allclose(got, expected)) {
+                        std::cerr << "FAIL pooled slice axis=" << axis
+                                  << " index=" << index
+                                  << " workers=" << workers << "\n";
+                        return 1;
+                    }
+                }
+
+                SliceBatchOptions options;
+                options.num_threads = workers;
+                options.window_slices = 3;
+                std::vector<std::vector<float>> got_batch(indices_for(axis).size());
+                reader.read_slices_batch_stream(axis, indices_for(axis), options,
+                    [&](size_t request_pos, uint64_t, std::vector<float>&& slice) {
+                        got_batch[request_pos] = std::move(slice);
+                    });
+                auto expected_batch = serial_reader.read_slices_batch(axis, indices_for(axis), 1);
+                for (size_t i = 0; i < expected_batch.size(); i++) {
+                    if (!allclose(got_batch[i], expected_batch[i])) {
+                        std::cerr << "FAIL pooled batch axis=" << axis
+                                  << " request=" << i
+                                  << " workers=" << workers << "\n";
+                        return 1;
+                    }
+                }
+            }
+            if (workers > 1 && reader.thread_pool_jobs() == 0) {
+                std::cerr << "FAIL pool was not used for workers=" << workers << "\n";
+                return 1;
+            }
+        }
+    }
+
+    {
+        BlockedFileReader reader(b3d_path.string(), 4);
+        std::atomic<long long> errs{0};
+        std::vector<std::thread> ths;
+        for (int t = 0; t < 8; t++) {
+            ths.emplace_back([&, t]() {
+                for (int it = 0; it < 40; it++) {
+                    char axis = axes[static_cast<size_t>((t + it) % 3)];
+                    const auto& indices = indices_for(axis);
+                    uint64_t idx = indices[static_cast<size_t>(it) % indices.size()];
+                    try {
+                        if ((it % 2) == 0) {
+                            auto got = reader.read_slice(axis, idx);
+                            auto expected = serial_reader.read_slice(axis, idx);
+                            if (!allclose(got, expected)) errs.fetch_add(1);
+                        } else {
+                            SliceBatchOptions options;
+                            options.num_threads = 4;
+                            options.window_slices = 2;
+                            std::vector<uint64_t> batch = indices;
+                            std::vector<std::vector<float>> got(batch.size());
+                            reader.read_slices_batch_stream(axis, batch, options,
+                                [&](size_t request_pos, uint64_t, std::vector<float>&& slice) {
+                                    got[request_pos] = std::move(slice);
+                                });
+                            auto expected = serial_reader.read_slices_batch(axis, batch, 1);
+                            for (size_t i = 0; i < expected.size(); i++)
+                                if (!allclose(got[i], expected[i])) errs.fetch_add(1);
+                        }
+                    } catch (...) {
+                        errs.fetch_add(1);
+                    }
+                }
+            });
+        }
+        for (auto& th : ths) th.join();
+        if (errs.load() != 0) {
+            std::cerr << "FAIL concurrent pooled reads: " << errs.load() << " errors\n";
             return 1;
         }
     }
@@ -726,6 +991,7 @@ int main() {
              | test_column_reads() | test_subvolume()
              | test_storage_ratio() | test_verify()
              | test_batch_read() | test_concurrent_adjacent_same_block_key()
+             | test_reader_thread_pool_lifecycle()
              | test_batch_column_read()
              | test_memory_budget();
     });

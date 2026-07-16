@@ -15,6 +15,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `include/block3d/`：公共 API、文件格式和布局类型
 - `src/`：转换、读取、CLI 和大数据基准实现
 - `tests/`：库测试及 CLI 进程集成测试
+- `experiments/`：正式实验日志、派生数据和报告归档
 - `generator_py/`：Python 测试数据生成器
 
 全局导航见 `code_map.md`，不要把子模块实现细节重新堆回根目录文档。
@@ -96,7 +97,9 @@ BlockedFileReader
 - `--warmup-scope dataset|workload` 分别表示预热整个数据区或固定请求计划会访问的工作集。
 - `block3d_cli bench` 的计时范围是 `read_only`；`run_test` 的计时范围是 `read_write_total`，主指标 `total_sec` 包含读取、文件创建/写入/关闭及可选 `_commit`/`fsync`。
 - 两个入口都输出固定 `PLAN_HASH`，确保 cold/hot 使用同一请求计划。`run_test both` 还会预估输出空间、创建独立的 `cold_scrubbed/` 与 `hot_prefetched/` 目录，并逐文件校验两阶段输出一致。
+- `run_test` 默认正式路径为 `batch_read=fused`、`pipeline=on`、`pipeline_memory=256MiB payload`、`pipeline_window=auto`、单 writer、`output_sync=requested`、`read_dispatch=round-robin`；该 dispatch 默认已由 2026-07-17 test18/test50 各 3 轮 A/B 中位数固定，开发开关只用于诊断、A/B 或回滚。
 - `run_test` 默认把控制台输出（包括错误）保存到当前工作目录的 `logs/`；`--no-log` 仅用于明确不需要日志的临时运行。
+- Phase 5 正式实验证据已归档到 `experiments/phase5_20260717/`：只包含文本日志、派生 CSV/TXT 和报告说明，不包含大型 `.raw` 输出。后续写报告或复核默认策略时优先引用该归档。
 
 ## 自适应块大小与存储检测
 
@@ -107,7 +110,8 @@ BlockedFileReader
 ## 切片内并行
 
 - `read_x_slice` / `read_y_slice` / `read_z_slice` 现已支持切片内多线程块处理。当块数 > `num_threads × 4` 时，已排序的块列表会跨线程分片，各线程写入输出缓冲区中不重叠的 `(Y,Z)` / `(X,Z)` / `(X,Y)` 区域。
-- `read_slices_batch` 已简化为顺序派发，因为每次 `read_slice` 调用已在内部使用全部线程——顺序处理可避免超额订阅。
+- `read_slices_batch` / `read_slices_batch_stream` 按 block layer/window 融合读取，与单片路径共享 reader 生命周期内的持久线程池。
+- reader 的块分发策略可显式选择 `round-robin` 或 `contiguous` physical chunks；默认仍为 `round-robin`，`--read-dispatch` 仅用于 Phase 4 A/B 和回滚，不应在评审现场动态搜索。
 
 ## 预热
 

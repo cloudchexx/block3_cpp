@@ -1,0 +1,118 @@
+Log saved to: logs/block3d_test18_20260716_161306_359_pid38228.log
+
+CACHE_CONFIG mode=both cold_method=scrub cold_isolation=suite warmup_scope=workload timing_scope=read_write_total
+[OUTPUT-SYNC] output_sync=requested
+[CASE-PLAN] axis=all mode=all cold_isolation=suite
+[VERIFY-MODE] verify=skipped
+
+
+======================================================================
+  Dataset: test18  (801x2405x2501)
+======================================================================
+[AUTO-BS] Detected SSD storage, auto block_size=56
+[SKIP] test18: 'Z:\wutan\block3d-data\test18.b3d' already exists (18.99 GB), valid format
+
+[CONFIG] seed=42 (fixed for random reads)
+         threads=16 (auto)
+         run_dir=Z:\wutan\block3d-data\benchmark_output\20260716_161306_359_pid38228
+         output_pattern=<phase>/test18_<axis>_<mode>_<seq>_<idx>.raw
+         output_sync=requested
+         timing_scope=read_write_total
+CACHE_CONFIG mode=both cold_method=scrub cold_isolation=suite warmup_scope=workload timing_scope=read_write_total
+TIMING_SCOPE value=read_write_total
+PLAN_HASH_SUITE value=0c5cecf06c8ed881
+PLAN_HASH axis=x mode=random value=ec538bbbe8e42dcf count=100
+PLAN_HASH axis=y mode=random value=e67288f0fd202bdc count=100
+PLAN_HASH axis=z mode=random value=f8b9ce98ac582ff4 count=100
+PLAN_HASH axis=x mode=sequential value=e2b261fdd67dcd09 count=10
+PLAN_HASH axis=y mode=sequential value=39bc1538f3c8ff56 count=10
+PLAN_HASH axis=z mode=sequential value=8388ff452309d81b count=10
+OUTPUT_SPACE estimated_bytes=8751257680 available_bytes=395754614784
+
+CACHE_PHASE name=cold_scrubbed
+[Phase] Cache scrub
+CACHE_SCRUB method=unrelated_file_sweep
+CACHE_SCRUB file=Z:\wutan\block3d-cache\scrub.bin
+CACHE_SCRUB bytes=50427377664 file_bytes=50427377664 required_bytes=50427377664 ram_ratio=1.5 passes=1
+CACHE_SCRUB elapsed_sec=77.7387 checksum=1569955852
+CACHE_VALIDITY state=scrub_success
+
+[RANDOM]
+         Axis       Total         Avg    Throughput
+         ------ -------- ---------- ------------
+         X         6.210s     62.10ms        16.1 slices/s  (read_sec=4.366s, write_sec=1.845s, read 100, written 100, 2.24 GB written)
+         per-slice bytes: 24059620 x100 (uniform), total=2405962000
+BENCHMARK_RESULT cache=cold_scrubbed mode=random axis=x total_sec=6.210 read_sec=4.366 write_sec=1.845 avg_ms=62.101 slices_per_sec=16.103 count=100 bytes=2405962000 output_sync=requested plan_hash=ec538bbbe8e42dcf
+         Y         8.836s     88.36ms        11.3 slices/s  (read_sec=8.242s, write_sec=0.594s, read 100, written 100, 0.75 GB written)
+         per-slice bytes: 8013204 x100 (uniform), total=801320400
+BENCHMARK_RESULT cache=cold_scrubbed mode=random axis=y total_sec=8.836 read_sec=8.242 write_sec=0.594 avg_ms=88.360 slices_per_sec=11.317 count=100 bytes=801320400 output_sync=requested plan_hash=e67288f0fd202bdc
+         Z         4.351s     43.51ms        23.0 slices/s  (read_sec=3.690s, write_sec=0.661s, read 100, written 100, 0.72 GB written)
+         per-slice bytes: 7705620 x100 (uniform), total=770562000
+BENCHMARK_RESULT cache=cold_scrubbed mode=random axis=z total_sec=4.351 read_sec=3.690 write_sec=0.661 avg_ms=43.509 slices_per_sec=22.984 count=100 bytes=770562000 output_sync=requested plan_hash=f8b9ce98ac582ff4
+         ------------------------------------------
+         Avg          64.66ms  balance=2.03x  (over 3 axes)
+
+[SEQUENTIAL]
+         Axis       Total         Avg    Throughput
+         ------ -------- ---------- ------------
+         X         0.258s     25.76ms        38.8 slices/s  (read_sec=0.092s, write_sec=0.166s, read 10, written 10, 0.22 GB written)
+         per-slice bytes: 24059620 x10 (uniform), total=240596200
+BENCHMARK_RESULT cache=cold_scrubbed mode=sequential axis=x total_sec=0.258 read_sec=0.092 write_sec=0.166 avg_ms=25.764 slices_per_sec=38.814 count=10 bytes=240596200 output_sync=requested plan_hash=e2b261fdd67dcd09
+         Y         0.110s     10.99ms        91.0 slices/s  (read_sec=0.051s, write_sec=0.059s, read 10, written 10, 0.07 GB written)
+         per-slice bytes: 8013204 x10 (uniform), total=80132040
+BENCHMARK_RESULT cache=cold_scrubbed mode=sequential axis=y total_sec=0.110 read_sec=0.051 write_sec=0.059 avg_ms=10.988 slices_per_sec=91.005 count=10 bytes=80132040 output_sync=requested plan_hash=39bc1538f3c8ff56
+         Z         0.134s     13.37ms        74.8 slices/s  (read_sec=0.076s, write_sec=0.058s, read 10, written 10, 0.07 GB written)
+         per-slice bytes: 7705620 x10 (uniform), total=77056200
+BENCHMARK_RESULT cache=cold_scrubbed mode=sequential axis=z total_sec=0.134 read_sec=0.076 write_sec=0.058 avg_ms=13.373 slices_per_sec=74.775 count=10 bytes=77056200 output_sync=requested plan_hash=8388ff452309d81b
+         ------------------------------------------
+         Avg          16.71ms  balance=2.34x  (over 3 axes)
+
+[Phase] Warm-up
+WARMUP_RESULT scope=workload elapsed_sec=7.41 bytes=4375628840 checksum=569892
+CACHE_PHASE name=hot_prefetched
+
+[RANDOM]
+         Axis       Total         Avg    Throughput
+         ------ -------- ---------- ------------
+         X         2.502s     25.02ms        40.0 slices/s  (read_sec=0.786s, write_sec=1.716s, read 100, written 100, 2.24 GB written)
+         per-slice bytes: 24059620 x100 (uniform), total=2405962000
+BENCHMARK_RESULT cache=hot_prefetched mode=random axis=x total_sec=2.502 read_sec=0.786 write_sec=1.716 avg_ms=25.019 slices_per_sec=39.969 count=100 bytes=2405962000 output_sync=requested plan_hash=ec538bbbe8e42dcf
+         Y         2.485s     24.85ms        40.2 slices/s  (read_sec=1.830s, write_sec=0.655s, read 100, written 100, 0.75 GB written)
+         per-slice bytes: 8013204 x100 (uniform), total=801320400
+BENCHMARK_RESULT cache=hot_prefetched mode=random axis=y total_sec=2.485 read_sec=1.830 write_sec=0.655 avg_ms=24.852 slices_per_sec=40.238 count=100 bytes=801320400 output_sync=requested plan_hash=e67288f0fd202bdc
+         Z         2.934s     29.34ms        34.1 slices/s  (read_sec=2.388s, write_sec=0.546s, read 100, written 100, 0.72 GB written)
+         per-slice bytes: 7705620 x100 (uniform), total=770562000
+BENCHMARK_RESULT cache=hot_prefetched mode=random axis=z total_sec=2.934 read_sec=2.388 write_sec=0.546 avg_ms=29.345 slices_per_sec=34.078 count=100 bytes=770562000 output_sync=requested plan_hash=f8b9ce98ac582ff4
+         ------------------------------------------
+         Avg          26.41ms  balance=1.18x  (over 3 axes)
+
+[SEQUENTIAL]
+         Axis       Total         Avg    Throughput
+         ------ -------- ---------- ------------
+         X         0.261s     26.06ms        38.4 slices/s  (read_sec=0.083s, write_sec=0.178s, read 10, written 10, 0.22 GB written)
+         per-slice bytes: 24059620 x10 (uniform), total=240596200
+BENCHMARK_RESULT cache=hot_prefetched mode=sequential axis=x total_sec=0.261 read_sec=0.083 write_sec=0.178 avg_ms=26.063 slices_per_sec=38.369 count=10 bytes=240596200 output_sync=requested plan_hash=e2b261fdd67dcd09
+         Y         0.100s     10.04ms        99.6 slices/s  (read_sec=0.047s, write_sec=0.054s, read 10, written 10, 0.07 GB written)
+         per-slice bytes: 8013204 x10 (uniform), total=80132040
+BENCHMARK_RESULT cache=hot_prefetched mode=sequential axis=y total_sec=0.100 read_sec=0.047 write_sec=0.054 avg_ms=10.038 slices_per_sec=99.626 count=10 bytes=80132040 output_sync=requested plan_hash=39bc1538f3c8ff56
+         Z         0.124s     12.44ms        80.4 slices/s  (read_sec=0.073s, write_sec=0.052s, read 10, written 10, 0.07 GB written)
+         per-slice bytes: 7705620 x10 (uniform), total=77056200
+BENCHMARK_RESULT cache=hot_prefetched mode=sequential axis=z total_sec=0.124 read_sec=0.073 write_sec=0.052 avg_ms=12.441 slices_per_sec=80.381 count=10 bytes=77056200 output_sync=requested plan_hash=8388ff452309d81b
+         ------------------------------------------
+         Avg          16.18ms  balance=2.60x  (over 3 axes)
+BENCHMARK_COMPARE mode=random axis=x observed_ratio=2.48
+BENCHMARK_COMPARE mode=random axis=y observed_ratio=3.56
+BENCHMARK_COMPARE mode=random axis=z observed_ratio=1.48
+BENCHMARK_COMPARE mode=sequential axis=x observed_ratio=0.99
+BENCHMARK_COMPARE mode=sequential axis=y observed_ratio=1.09
+BENCHMARK_COMPARE mode=sequential axis=z observed_ratio=1.07
+OUTPUT_VERIFY_RESULT ok=1 files_checked=330 bytes_checked=4375628840
+
+======================================================================
+  SUMMARY -- test18
+======================================================================
+  Storage:   18.99 GB / 17.95 GB = 1.058x
+  Outputs:   Z:\wutan\block3d-data\benchmark_output\20260716_161306_359_pid38228
+======================================================================
+
+Total elapsed: 134.1s

@@ -71,12 +71,14 @@ convert_raw_to_blocked(raw, output, dx, dy, dz,
 
 ### `BlockedFileReader`
 
-- 切片：`read_x/y/z_slice()`、`read_slice()`、`read_slices_batch()`。
+- 切片：`read_x/y/z_slice()`、`read_slice()`、`read_slices_batch()`、`read_slices_batch_stream()`。批量入口先校验 axis 和整批 index，再按 layer/window 融合读取；兼容 API 按 `request_pos` 收集，保持请求顺序和重复语义。
+- 块分发策略：`ReadDispatchStrategy::RoundRobin` / `Contiguous`，由 `BlockedFileReader` 构造参数固定；CLI 的 `--read-dispatch round-robin|contiguous` 用于 A/B 和回滚，不改变 `.b3d` 格式或输出语义。2026-07-17 Phase 5 归档证据位于 `../../experiments/phase5_20260717/`，正式默认策略保持 round-robin。
 - 列：`read_x/y/z_column()` 及批量版本。
 - 区域：`read_subvolume()`、`read_full_volume()`。
 - 点与校验：`read_point()`、`verify()`。
 - 缓存预热：`warm_up()`、`wait_warm_up()`。
-- 元数据：尺寸、块大小、块总数、数据偏移和布局 getter。
+- reader 生命周期持久线程池：切片和 fused batch 的块级并行复用构造时创建的 worker；可按 reader 的 dispatch strategy 使用 round-robin 或 contiguous physical chunks，`options.num_threads` 作为单次调用 worker 上限。
+- 元数据：尺寸、块大小、块总数、数据偏移、布局 getter，以及 `thread_pool_workers()` / `thread_pool_jobs()` / `thread_pool_serial_fallbacks()` 诊断 getter。
 
 ## `benchmark_cache.hpp` — 冷/热缓存 benchmark 接口
 

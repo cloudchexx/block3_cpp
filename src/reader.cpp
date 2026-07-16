@@ -5,6 +5,11 @@
 #include <thread>
 #include <atomic>
 #include <fstream>
+#include <mutex>
+#include <condition_variable>
+#include <exception>
+#include <type_traits>
+#include <utility>
 
 #ifdef OMP_ENABLED
 #include <omp.h>
@@ -30,12 +35,20 @@ MappedFile::MappedFile(const std::string& path) { do_mmap(path); }
 MappedFile::~MappedFile() { close(); }
 
 MappedFile::MappedFile(MappedFile&& other) noexcept
-    : mapped_data_(other.mapped_data_), size_(other.size_),
-      file_handle_(other.file_handle_), map_handle_(other.map_handle_)
+    : mapped_data_(other.mapped_data_), size_(other.size_)
+#ifdef _WIN32
+      , file_handle_(other.file_handle_), map_handle_(other.map_handle_)
+#else
+      , fd_(other.fd_)
+#endif
 {
     other.mapped_data_ = nullptr;
+#ifdef _WIN32
     other.file_handle_ = nullptr;
     other.map_handle_  = nullptr;
+#else
+    other.fd_ = -1;
+#endif
     other.size_ = 0;
 }
 
@@ -44,11 +57,16 @@ MappedFile& MappedFile::operator=(MappedFile&& other) noexcept {
         close();
         mapped_data_ = other.mapped_data_;
         size_        = other.size_;
+#ifdef _WIN32
         file_handle_ = other.file_handle_;
         map_handle_  = other.map_handle_;
-        other.mapped_data_ = nullptr;
         other.file_handle_ = nullptr;
         other.map_handle_  = nullptr;
+#else
+        fd_ = other.fd_;
+        other.fd_ = -1;
+#endif
+        other.mapped_data_ = nullptr;
         other.size_ = 0;
     }
     return *this;
@@ -150,41 +168,213 @@ void MappedFile::prefault(size_t offset, size_t length, size_t stride) {
 // output buffer, so they can safely run in parallel without locks.
 // Falls back to serial when block_count ≤ num_threads × 4.
 
-namespace {
+class BlockedFileReader::ThreadPool {
+public:
+    explicit ThreadPool(int num_threads) {
+        size_t nw = num_threads > 1 ? static_cast<size_t>(num_threads) : 0;
+        workers_.reserve(nw);
+        for (size_t id = 0; id < nw; id++) {
+            workers_.emplace_back([this, id] { worker_loop(id); });
+        }
+    }
+
+    ~ThreadPool() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+            generation_++;
+        }
+        start_cv_.notify_all();
+        for (auto& worker : workers_) {
+            if (worker.joinable()) worker.join();
+        }
+    }
+
+    size_t worker_count() const { return workers_.size(); }
+    uint64_t jobs() const { return jobs_.load(std::memory_order_relaxed); }
+    uint64_t serial_fallbacks() const {
+        return serial_fallbacks_.load(std::memory_order_relaxed);
+    }
+
+    void record_serial_fallback() {
+        serial_fallbacks_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    template<typename F>
+    void parallel_for(size_t max_workers,
+                      ReadDispatchStrategy strategy,
+                      const std::vector<BlockCoord>& blocks,
+                      F&& process) {
+        if (workers_.empty() || max_workers <= 1 || in_worker_thread_) {
+            serial_fallbacks_.fetch_add(1, std::memory_order_relaxed);
+            for (const auto& block : blocks) process(block);
+            return;
+        }
+
+        using Fn = typename std::remove_reference<F>::type;
+        Fn* fn = &process;
+        auto invoke = [](void* ctx, const BlockCoord& block) {
+            (*static_cast<Fn*>(ctx))(block);
+        };
+
+        std::unique_lock<std::mutex> lock(mutex_);
+        idle_cv_.wait(lock, [&] { return !active_; });
+
+        active_ = true;
+        blocks_ = &blocks;
+        context_ = fn;
+        invoke_ = invoke;
+        strategy_ = strategy;
+        active_worker_count_ = std::min({workers_.size(), blocks.size(), max_workers});
+        completed_workers_ = 0;
+        exception_ = nullptr;
+        cancelled_.store(false, std::memory_order_release);
+        jobs_.fetch_add(1, std::memory_order_relaxed);
+        generation_++;
+
+        start_cv_.notify_all();
+        done_cv_.wait(lock, [&] { return completed_workers_ == active_worker_count_; });
+
+        std::exception_ptr exception = exception_;
+        active_ = false;
+        blocks_ = nullptr;
+        context_ = nullptr;
+        invoke_ = nullptr;
+        strategy_ = ReadDispatchStrategy::RoundRobin;
+        active_worker_count_ = 0;
+        idle_cv_.notify_one();
+
+        if (exception) std::rethrow_exception(exception);
+    }
+
+private:
+    using InvokeFn = void (*)(void*, const BlockCoord&);
+
+    static thread_local bool in_worker_thread_;
+
+    void worker_loop(size_t worker_id) {
+        in_worker_thread_ = true;
+        uint64_t seen_generation = 0;
+        for (;;) {
+            const std::vector<BlockCoord>* blocks = nullptr;
+            void* context = nullptr;
+            InvokeFn invoke = nullptr;
+            size_t worker_count = 0;
+            ReadDispatchStrategy strategy = ReadDispatchStrategy::RoundRobin;
+            uint64_t job_generation = 0;
+
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                start_cv_.wait(lock, [&] {
+                    return stopping_ || generation_ != seen_generation;
+                });
+                if (stopping_) break;
+                seen_generation = generation_;
+                if (!active_ || worker_id >= active_worker_count_) continue;
+
+                blocks = blocks_;
+                context = context_;
+                invoke = invoke_;
+                worker_count = active_worker_count_;
+                strategy = strategy_;
+                job_generation = generation_;
+            }
+
+            try {
+                if (strategy == ReadDispatchStrategy::Contiguous) {
+                    size_t chunk = (blocks->size() + worker_count - 1) / worker_count;
+                    size_t begin = worker_id * chunk;
+                    size_t end = std::min(blocks->size(), begin + chunk);
+                    for (size_t i = begin; i < end; i++) {
+                        if (cancelled_.load(std::memory_order_acquire)) break;
+                        invoke(context, (*blocks)[i]);
+                    }
+                } else {
+                    for (size_t i = worker_id; i < blocks->size(); i += worker_count) {
+                        if (cancelled_.load(std::memory_order_acquire)) break;
+                        invoke(context, (*blocks)[i]);
+                    }
+                }
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (job_generation == generation_ && !exception_) {
+                    exception_ = std::current_exception();
+                    cancelled_.store(true, std::memory_order_release);
+                }
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (job_generation == generation_) {
+                    completed_workers_++;
+                    if (completed_workers_ == active_worker_count_) done_cv_.notify_one();
+                }
+            }
+        }
+        in_worker_thread_ = false;
+    }
+
+    std::vector<std::thread> workers_;
+    mutable std::mutex mutex_;
+    std::condition_variable start_cv_;
+    std::condition_variable done_cv_;
+    std::condition_variable idle_cv_;
+
+    bool stopping_ = false;
+    bool active_ = false;
+    uint64_t generation_ = 0;
+    size_t active_worker_count_ = 0;
+    size_t completed_workers_ = 0;
+    const std::vector<BlockCoord>* blocks_ = nullptr;
+    void* context_ = nullptr;
+    InvokeFn invoke_ = nullptr;
+    ReadDispatchStrategy strategy_ = ReadDispatchStrategy::RoundRobin;
+    std::exception_ptr exception_;
+    std::atomic<bool> cancelled_{false};
+    std::atomic<uint64_t> jobs_{0};
+    std::atomic<uint64_t> serial_fallbacks_{0};
+};
+
+thread_local bool BlockedFileReader::ThreadPool::in_worker_thread_ = false;
 
 template<typename F>
-void for_each_block_parallel(int num_threads,
-                              const std::vector<BlockCoord>& blocks,
-                              F&& process) {
+void BlockedFileReader::for_each_block_parallel(
+        int requested_threads,
+        const std::vector<BlockCoord>& blocks,
+        F&& process) {
     size_t nb = blocks.size();
-    int nt = num_threads;
+    int nt = requested_threads > 0 ? requested_threads : num_threads_;
     if (nt <= 1 || nb <= static_cast<size_t>(nt) * 4) {
+        if (thread_pool_) thread_pool_->record_serial_fallback();
         for (size_t i = 0; i < nb; i++) process(blocks[i]);
         return;
     }
-    size_t nw = static_cast<size_t>(nt);
-    if (nw > nb) nw = nb;
-    std::vector<std::thread> threads;
-    threads.reserve(nw);
-    for (size_t t = 0; t < nw; t++) {
-        threads.emplace_back([&, t]() {
-            for (size_t i = t; i < nb; i += nw) process(blocks[i]);
-        });
+    if (!thread_pool_) {
+        for (size_t i = 0; i < nb; i++) process(blocks[i]);
+        return;
     }
-    for (auto& th : threads) th.join();
+    size_t max_workers = static_cast<size_t>(nt);
+    thread_pool_->parallel_for(max_workers, dispatch_strategy_, blocks, std::forward<F>(process));
 }
 
-} // anonymous namespace
+template<typename F>
+void BlockedFileReader::for_each_block_parallel(
+        const std::vector<BlockCoord>& blocks,
+        F&& process) {
+    for_each_block_parallel(num_threads_, blocks, std::forward<F>(process));
+}
 
 // ── BlockedFileReader ─────────────────────────────────────────────────
 
 BlockedFileReader::BlockedFileReader(const std::string& file_path,
                                      int num_threads,
-                                     uint64_t max_memory_mb)
+                                     uint64_t max_memory_mb,
+                                     ReadDispatchStrategy dispatch_strategy)
     : num_threads_(num_threads > 0 ? num_threads
                                    : static_cast<int>(
                                          std::thread::hardware_concurrency())),
-      max_memory_mb_(max_memory_mb)
+      max_memory_mb_(max_memory_mb),
+      dispatch_strategy_(dispatch_strategy)
 {
     if (num_threads_ < 1) num_threads_ = 1;
 
@@ -213,6 +403,23 @@ BlockedFileReader::BlockedFileReader(const std::string& file_path,
            total_blocks_ * sizeof(uint64_t));
 
     mapped_file_ = MappedFile(file_path);
+    if (num_threads_ > 1) {
+        thread_pool_ = std::make_unique<ThreadPool>(num_threads_);
+    }
+}
+
+BlockedFileReader::~BlockedFileReader() = default;
+
+size_t BlockedFileReader::thread_pool_workers() const {
+    return thread_pool_ ? thread_pool_->worker_count() : 0;
+}
+
+uint64_t BlockedFileReader::thread_pool_jobs() const {
+    return thread_pool_ ? thread_pool_->jobs() : 0;
+}
+
+uint64_t BlockedFileReader::thread_pool_serial_fallbacks() const {
+    return thread_pool_ ? thread_pool_->serial_fallbacks() : 0;
 }
 
 void BlockedFileReader::warm_up(bool async, size_t stride,
@@ -358,7 +565,7 @@ std::vector<float> BlockedFileReader::read_x_slice(uint64_t x) {
 
     auto blocks = sorted_block_list('x', x);
 
-    for_each_block_parallel(num_threads_, blocks,
+    for_each_block_parallel(blocks,
         [&](const BlockCoord& c) {
             if (c.bx != bx) return;
 
@@ -398,7 +605,7 @@ std::vector<float> BlockedFileReader::read_y_slice(uint64_t y) {
 
     auto blocks = sorted_block_list('y', y);
 
-    for_each_block_parallel(num_threads_, blocks,
+    for_each_block_parallel(blocks,
         [&](const BlockCoord& c) {
             if (c.by_ != by_) return;
 
@@ -441,7 +648,7 @@ std::vector<float> BlockedFileReader::read_z_slice(uint64_t z) {
 
     auto blocks = sorted_block_list('z', z);
 
-    for_each_block_parallel(num_threads_, blocks,
+    for_each_block_parallel(blocks,
         [&](const BlockCoord& c) {
             if (c.bz != bz) return;
 
@@ -478,17 +685,167 @@ BlockedFileReader::read_slice(char axis, uint64_t index) {
     }
 }
 
+namespace {
+
+struct SliceRequest {
+    size_t request_pos = 0;
+    uint64_t index = 0;
+    uint32_t layer = 0;
+    uint32_t local = 0;
+};
+
+} // anonymous namespace
+
+void BlockedFileReader::read_slices_batch_stream(
+        char axis,
+        const std::vector<uint64_t>& indices,
+        const SliceBatchOptions& options,
+        const SliceConsumer& consumer) {
+    if (!consumer) {
+        throw std::invalid_argument("Slice consumer is empty");
+    }
+
+    uint64_t dim = 0;
+    uint64_t slice_elems = 0;
+    switch (axis) {
+    case 'x':
+        dim = dim_x_;
+        slice_elems = dim_y_ * dim_z_;
+        break;
+    case 'y':
+        dim = dim_y_;
+        slice_elems = dim_x_ * dim_z_;
+        break;
+    case 'z':
+        dim = dim_z_;
+        slice_elems = dim_x_ * dim_y_;
+        break;
+    default:
+        throw std::invalid_argument("Unknown axis: " + str_axis(axis));
+    }
+    for (uint64_t index : indices) {
+        if (index >= dim) {
+            throw std::out_of_range("Batch slice index out of range");
+        }
+    }
+
+    if (indices.empty()) return;
+
+    uint64_t bs = block_size_;
+    std::vector<std::vector<SliceRequest>> groups;
+    std::unordered_map<uint32_t, size_t> group_by_layer;
+    groups.reserve(indices.size());
+    for (size_t i = 0; i < indices.size(); i++) {
+        SliceRequest req;
+        req.request_pos = i;
+        req.index = indices[i];
+        req.layer = static_cast<uint32_t>(indices[i] / bs);
+        req.local = static_cast<uint32_t>(indices[i] % bs);
+
+        auto [it, inserted] = group_by_layer.emplace(req.layer, groups.size());
+        if (inserted) groups.emplace_back();
+        groups[it->second].push_back(req);
+    }
+
+    size_t window_slices = options.window_slices == 0 ? 1 : options.window_slices;
+    int nt = options.num_threads > 0 ? options.num_threads : num_threads_;
+    if (nt < 1) nt = 1;
+    const float* dv = mapped_file_.data();
+
+    for (const auto& group : groups) {
+        if (group.empty()) continue;
+        auto blocks = sorted_block_list(axis,
+                                        static_cast<uint64_t>(group.front().layer) * bs);
+        for (size_t start = 0; start < group.size(); start += window_slices) {
+            size_t end = std::min(group.size(), start + window_slices);
+            std::vector<std::vector<float>> window(end - start,
+                                                   std::vector<float>(slice_elems));
+
+            for_each_block_parallel(nt, blocks,
+                [&](const BlockCoord& c) {
+                    if (axis == 'x') {
+                        uint64_t y0 = static_cast<uint64_t>(c.by_) * bs;
+                        uint64_t z0 = static_cast<uint64_t>(c.bz) * bs;
+                        uint64_t ny_part = std::min(bs, dim_y_ - y0);
+                        uint64_t nz_part = std::min(bs, dim_z_ - z0);
+                        uint64_t boff = block_offset_float(c.bx, c.by_, c.bz);
+                        for (size_t wi = 0; wi < window.size(); wi++) {
+                            const SliceRequest& req = group[start + wi];
+                            const float* src = dv + boff
+                                + static_cast<uint64_t>(req.local) * bs * bs;
+                            auto& result = window[wi];
+                            for (uint64_t ly = 0; ly < ny_part; ly++) {
+                                float* dst = &result[(y0 + ly) * dim_z_ + z0];
+                                const float* srow = src + ly * bs;
+                                for (uint64_t lz = 0; lz < nz_part; lz++) {
+                                    dst[lz] = srow[lz];
+                                }
+                            }
+                        }
+                    } else if (axis == 'y') {
+                        uint64_t x0 = static_cast<uint64_t>(c.bx) * bs;
+                        uint64_t z0 = static_cast<uint64_t>(c.bz) * bs;
+                        uint64_t nx_part = std::min(bs, dim_x_ - x0);
+                        uint64_t nz_part = std::min(bs, dim_z_ - z0);
+                        uint64_t boff = block_offset_float(c.bx, c.by_, c.bz);
+                        for (size_t wi = 0; wi < window.size(); wi++) {
+                            const SliceRequest& req = group[start + wi];
+                            auto& result = window[wi];
+                            for (uint32_t lx = 0; lx < nx_part; lx++) {
+                                const float* src = dv + boff
+                                    + static_cast<uint64_t>(lx) * bs * bs
+                                    + static_cast<uint64_t>(req.local) * bs;
+                                float* dst = &result[(x0 + lx) * dim_z_ + z0];
+                                for (uint64_t lz = 0; lz < nz_part; lz++) {
+                                    dst[lz] = src[lz];
+                                }
+                            }
+                        }
+                    } else {
+                        uint64_t x0 = static_cast<uint64_t>(c.bx) * bs;
+                        uint64_t y0 = static_cast<uint64_t>(c.by_) * bs;
+                        uint64_t nx_part = std::min(bs, dim_x_ - x0);
+                        uint64_t ny_part = std::min(bs, dim_y_ - y0);
+                        uint64_t boff = block_offset_float(c.bx, c.by_, c.bz);
+                        uint64_t bs2 = bs * bs;
+                        for (uint32_t lx = 0; lx < nx_part; lx++) {
+                            const float* src_plane = dv + boff
+                                + static_cast<uint64_t>(lx) * bs2;
+                            uint64_t x_row = (x0 + lx) * dim_y_;
+                            for (uint32_t ly = 0; ly < ny_part; ly++) {
+                                const float* src = src_plane
+                                    + static_cast<uint64_t>(ly) * bs;
+                                uint64_t dst_idx = x_row + (y0 + ly);
+                                for (size_t wi = 0; wi < window.size(); wi++) {
+                                    const SliceRequest& req = group[start + wi];
+                                    window[wi][dst_idx] = src[req.local];
+                                }
+                            }
+                        }
+                    }
+                });
+
+            for (size_t wi = 0; wi < window.size(); wi++) {
+                const SliceRequest& req = group[start + wi];
+                consumer(req.request_pos, req.index, std::move(window[wi]));
+            }
+        }
+    }
+}
+
 std::vector<std::vector<float>>
 BlockedFileReader::read_slices_batch(char axis,
                                      const std::vector<uint64_t>& indices,
-                                     int /*num_threads*/) {
-    // Each read_slice call parallelises block processing internally via
-    // num_threads_.  Process slices sequentially to avoid oversubscription.
+                                     int num_threads) {
     size_t n = indices.size();
     std::vector<std::vector<float>> results(n);
-    for (size_t i = 0; i < n; i++) {
-        results[i] = read_slice(axis, indices[i]);
-    }
+    SliceBatchOptions options;
+    options.num_threads = num_threads;
+    options.window_slices = 1;
+    read_slices_batch_stream(axis, indices, options,
+        [&](size_t request_pos, uint64_t, std::vector<float>&& slice) {
+            results[request_pos] = std::move(slice);
+        });
     return results;
 }
 

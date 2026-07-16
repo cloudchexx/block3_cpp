@@ -10,6 +10,8 @@ build/
 
 # Logs
 logs/
+!experiments/**/logs/
+!experiments/**/logs/**/*.log
 
 # Benchmark output (large raw slice files)
 benchmark_output/

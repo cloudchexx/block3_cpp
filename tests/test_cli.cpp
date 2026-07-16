@@ -272,7 +272,14 @@ int main(int argc, char* argv[]) {
         + " --num-reads 2 --threads 2 --cache-mode both --cold-method none --warmup-scope workload",
         "BENCHMARK_COMPARE");
 
-    // 8. Compatibility --warm-up means hot-only, and invalid/conflicting cache
+    // 8. Phase 1 fused batch mode is logged in machine-readable form.
+    expect_output_contains("bench fused config logs",
+        q(cli) + " bench " + q(b3d)
+        + " --num-reads 1 --threads 2 --cache-mode hot --warmup-scope workload"
+        + " --batch-read fused --batch-window 3 --pipeline off --read-dispatch round-robin",
+        "BATCH_READ mode=fused window_slices=3");
+
+    // 9. Compatibility --warm-up means hot-only, and invalid/conflicting cache
     //    parameters fail cleanly instead of running the wrong benchmark state.
     expect_output_contains("bench warm-up hot-only",
         q(cli) + " bench " + q(b3d)
@@ -284,6 +291,13 @@ int main(int argc, char* argv[]) {
         q(cli) + " bench " + q(b3d) + " --warm-up --cache-mode both --cold-method none");
     expect_clean_fail("bench missing scrub file",
         q(cli) + " bench " + q(b3d) + " --cache-mode cold --cold-method scrub --cold-scrub-file " + q(nope));
+    expect_clean_fail("bench invalid batch-window",
+        q(cli) + " bench " + q(b3d) + " --cache-mode hot --batch-window 0");
+    expect_clean_fail("bench read-only rejects pipeline switch",
+        q(cli) + " bench " + q(b3d) + " --cache-mode hot --pipeline on");
+    expect_output_contains("bench contiguous dispatch switch",
+        q(cli) + " bench " + q(b3d) + " --num-reads 1 --threads 2 --cache-mode hot --read-dispatch contiguous",
+        "READ_DISPATCH strategy=contiguous");
 
     fs::remove_all(tmp, ec);
 

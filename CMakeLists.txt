@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.14)
 project(block3d VERSION 1.0.0 LANGUAGES CXX)
 
+find_package(Python3 COMPONENTS Interpreter)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -42,6 +44,17 @@ add_test(NAME test_block3d COMMAND test_block3d)
 # argument parsing and graceful error handling, not just the library API.
 add_executable(test_cli tests/test_cli.cpp)
 add_test(NAME test_cli COMMAND test_cli)
+
+if(Python3_Interpreter_FOUND)
+    add_test(NAME test_dispatch_compare_tool
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/compare_dispatch_ab.py
+            --round-robin ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/dispatch_rr_1.log
+                          ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/dispatch_rr_2.log
+                          ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/dispatch_rr_3.log
+            --contiguous ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/dispatch_contig_1.log
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/dispatch_contig_2.log
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/dispatch_contig_3.log)
+endif()
 
 add_executable(run_test src/run_test.cpp)
 target_link_libraries(run_test PRIVATE block3d block3d_benchmark_cache)

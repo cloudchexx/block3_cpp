@@ -23,8 +23,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - 同一块层的切片共享缓存键 `(axis, index / block_size)`。
 - 缓存内容必须复制后在锁外使用；这是并发回归测试覆盖的安全边界。
 - 切片读取现已内置切片内多线程（`for_each_block_parallel`）：当块数 > `num_threads × 4` 时，已排序的块列表跨线程分片处理，各线程安全写入输出缓冲区的不重叠区域。
-- `read_slices_batch` 已简化为顺序派发——每次 `read_slice` 调用已在内部用完所有线程，顺序处理可避免超额订阅。
-- 批量接口按请求并行，不是单切片内部块级并行。
+- `read_slices_batch` / `read_slices_batch_stream` 按 block layer/window 融合读取，同一 layer/window 只遍历物理排序块列表一次，并通过 `request_pos` 保持请求顺序和重复语义。
+- `BlockedFileReader` 构造时创建持久线程池；块分发策略由 reader 固定为 `ReadDispatchStrategy::RoundRobin` 或 `Contiguous`，CLI 的 `--read-dispatch round-robin|contiguous` 只用于受控 A/B 和回滚。
 - 维护 Windows/POSIX mmap 分支时，平台专属成员访问必须处于相应 `#ifdef` 中。
 
 ### CLI 与 benchmark
@@ -40,6 +40,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `run_test both` 必须使用独立 phase 目录（`cold_scrubbed/`、`hot_prefetched/` 或 `cold_first_touch/`），运行前估算输出空间，完成后逐文件校验 cold/hot 输出一致；日志默认保存到当前工作目录 `logs/` 且包含 stderr。
 - `--warm-up` 标志（`bench` 和 `run_test` 均支持）在计时前将数据区预加载到 OS 页缓存；预热后的测量结果是热缓存数据。
 - `convert` 的 `--block-size` 默认值为 0（自动检测）；显式 N 可覆盖。`--block-size 0` 与省略等效。验证区间为 0 或 16–256。
+- `run_test` 默认正式路径为 `batch_read=fused`、`pipeline=on`、`pipeline_memory=256MiB`、`pipeline_window=auto`、单 writer、`output_sync=requested`、`read_dispatch=round-robin`；该 dispatch 默认已由 2026-07-17 test18/test50 各 3 轮 A/B 中位数固定，`--pipeline off`、`--batch-read legacy` 和 `--read-dispatch contiguous` 仅用于诊断、A/B 或回滚。
+- Phase 5 默认路径的正式日志与派生 CSV 已归档在 `../experiments/phase5_20260717/`；修改 benchmark 输出字段或默认路径时，同步考虑该归档说明是否需要补充新实验。
 - `run_test` 除内置 `test18`/`test50` 外，支持自定义数据集：未识别的名称通过 `--dim-x/--dim-y/--dim-z` 指定维度，文件自动推导为 `{name}.dat` / `{name}.b3d`。
 
 ## 构建与验证

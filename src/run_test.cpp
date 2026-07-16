@@ -17,6 +17,11 @@
 #include <filesystem>
 #include <streambuf>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <atomic>
+#include <exception>
 #include <cstdio>
 #include <limits>
 #include <array>
@@ -187,6 +192,16 @@ static std::string size_str(uint64_t bytes) {
     return oss.str();
 }
 
+static std::string normalize_dispatch(const std::string& value) {
+    return value == "round-robin" ? "round_robin" : value;
+}
+
+static ReadDispatchStrategy parse_dispatch_strategy(const std::string& value) {
+    return value == "contiguous"
+        ? ReadDispatchStrategy::Contiguous
+        : ReadDispatchStrategy::RoundRobin;
+}
+
 // Resolve data file path, searching multiple directories.
 // Search order: CWD, CWD/.., exe_dir, exe_dir/.., exe_dir/../..
 static std::string resolve_path(const std::string& name,
@@ -249,12 +264,40 @@ struct BenchResult {
     double total_sec = 0;
     double avg_ms = 0;
     double throughput = 0;
+    double producer_wall_sec = 0;
+    double writer_service_sec = 0;
+    double drain_sec = 0;
+    double producer_wait_sec = 0;
+    size_t queue_peak_slices = 0;
+    uint64_t queue_peak_bytes = 0;
+    uint64_t pipeline_memory_mb = 0;
+    size_t pipeline_window_slices = 0;
+    size_t pipeline_queue_slices = 0;
+    size_t pipeline_max_live_slices = 0;
+    uint64_t pipeline_payload_peak_bound_bytes = 0;
+    size_t reader_pool_workers = 0;
+    uint64_t reader_pool_jobs = 0;
+    uint64_t reader_pool_serial_fallbacks = 0;
     size_t   n_read = 0;       // slices returned by read_slices_batch
     size_t   n_written = 0;    // slices fully written (open/write/sync/close ok)
     uint64_t total_bytes = 0;
     std::vector<uint64_t> indices;
     std::vector<uint64_t> slice_bytes;
     bool io_error = false;
+    bool pipeline_enabled = false;
+};
+
+struct PipelineConfig {
+    bool enabled = false;
+    uint64_t memory_mb = 256;
+    size_t window_slices = 0; // 0 = auto
+};
+
+struct PipelineRuntimeConfig {
+    size_t read_window_slices = 1;
+    size_t queue_capacity_slices = 1;
+    size_t max_live_slices = 1;
+    uint64_t memory_bytes = 0;
 };
 
 static fs::path output_file_path(const fs::path& out_dir,
@@ -270,72 +313,377 @@ static fs::path output_file_path(const fs::path& out_dir,
     return out_dir / fn.str();
 }
 
+struct SliceJob {
+    size_t request_pos = 0;
+    uint64_t index = 0;
+    fs::path output_path;
+    std::vector<float> data;
+};
+
+struct WriteResult {
+    bool ok = false;
+    uint64_t bytes = 0;
+    std::string error_path;
+};
+
+static WriteResult write_slice_file(const SliceJob& job, bool output_sync) {
+    WriteResult result;
+    result.error_path = job.output_path.string();
+    std::string fp_str = job.output_path.string();
+
+    FILE* f = std::fopen(fp_str.c_str(), "wb");
+    if (!f) return result;
+
+    result.bytes = job.data.size() * sizeof(float);
+    bool ok = std::fwrite(job.data.data(), 1,
+                          static_cast<size_t>(result.bytes), f)
+              == static_cast<size_t>(result.bytes);
+    if (ok && output_sync) ok = sync_output(f);
+    if (std::fclose(f) != 0) ok = false;
+    result.ok = ok;
+    return result;
+}
+
+class BoundedSliceQueue {
+public:
+    explicit BoundedSliceQueue(size_t capacity_slices)
+        : capacity_slices_(std::max<size_t>(1, capacity_slices)) {}
+
+    bool push(SliceJob&& job, double& wait_sec) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        auto wait_begin = std::chrono::high_resolution_clock::now();
+        not_full_.wait(lock, [&] { return cancelled_ || queue_.size() < capacity_slices_; });
+        auto wait_end = std::chrono::high_resolution_clock::now();
+        wait_sec += std::chrono::duration<double>(wait_end - wait_begin).count();
+        if (cancelled_) return false;
+
+        uint64_t bytes = job.data.size() * sizeof(float);
+        queued_bytes_ += bytes;
+        queue_.push_back(std::move(job));
+        peak_slices_ = std::max(peak_slices_, queue_.size());
+        peak_bytes_ = std::max(peak_bytes_, queued_bytes_);
+        not_empty_.notify_one();
+        return true;
+    }
+
+    bool pop(SliceJob& job) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        not_empty_.wait(lock, [&] { return closed_ || cancelled_ || !queue_.empty(); });
+        if (queue_.empty()) return false;
+        job = std::move(queue_.front());
+        queue_.pop_front();
+        queued_bytes_ -= job.data.size() * sizeof(float);
+        not_full_.notify_one();
+        return true;
+    }
+
+    void close() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        closed_ = true;
+        not_empty_.notify_all();
+    }
+
+    void cancel() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        cancelled_ = true;
+        queue_.clear();
+        queued_bytes_ = 0;
+        not_empty_.notify_all();
+        not_full_.notify_all();
+    }
+
+    size_t peak_slices() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return peak_slices_;
+    }
+
+    uint64_t peak_bytes() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return peak_bytes_;
+    }
+
+private:
+    size_t capacity_slices_;
+    mutable std::mutex mutex_;
+    std::condition_variable not_empty_;
+    std::condition_variable not_full_;
+    std::deque<SliceJob> queue_;
+    uint64_t queued_bytes_ = 0;
+    size_t peak_slices_ = 0;
+    uint64_t peak_bytes_ = 0;
+    bool closed_ = false;
+    bool cancelled_ = false;
+};
+
+static uint64_t mb_to_bytes(uint64_t mb) {
+    if (mb > std::numeric_limits<uint64_t>::max() / (1024ULL * 1024ULL))
+        return std::numeric_limits<uint64_t>::max();
+    return mb * 1024ULL * 1024ULL;
+}
+
+static PipelineRuntimeConfig make_pipeline_runtime(uint64_t slice_bytes,
+                                                   const PipelineConfig& config) {
+    PipelineRuntimeConfig runtime;
+    runtime.memory_bytes = mb_to_bytes(config.memory_mb);
+    uint64_t max_live = runtime.memory_bytes / std::max<uint64_t>(1, slice_bytes);
+    if (max_live == 0) max_live = 1;
+    runtime.max_live_slices = static_cast<size_t>(std::min<uint64_t>(
+        max_live, static_cast<uint64_t>(std::numeric_limits<size_t>::max())));
+
+    uint64_t window_limit = max_live > 1 ? max_live - 1 : 1;
+    if (config.window_slices > 0) {
+        runtime.read_window_slices = static_cast<size_t>(std::min<uint64_t>(
+            static_cast<uint64_t>(config.window_slices), window_limit));
+    } else {
+        runtime.read_window_slices = static_cast<size_t>(std::min<uint64_t>(4, window_limit));
+    }
+    runtime.read_window_slices = std::max<size_t>(1, runtime.read_window_slices);
+
+    if (max_live > 1) {
+        runtime.queue_capacity_slices = static_cast<size_t>(std::max<uint64_t>(
+            1, max_live - static_cast<uint64_t>(runtime.read_window_slices)));
+    } else {
+        runtime.queue_capacity_slices = 0;
+    }
+    return runtime;
+}
+
 static BenchResult run_bench(const std::string& b3d_path,
                               char axis,
                               const std::string& mode,
                               const std::vector<uint64_t>& indices,
                               const fs::path& out_dir,
                               const std::string& ds_name,
-                              bool output_sync) {
+                              bool output_sync,
+                              const std::string& batch_read,
+                              size_t batch_window_slices,
+                              const PipelineConfig& pipeline_config,
+                              uint64_t planned_slice_bytes,
+                              ReadDispatchStrategy dispatch_strategy) {
     // Reader construction (mmap + header parse) is intentionally OUTSIDE the
     // timing window: this is a steady-state batch measurement, not an
     // end-to-end measurement that includes reader/process setup.
-    BlockedFileReader reader(b3d_path);
+    BlockedFileReader reader(b3d_path, 0, 0, dispatch_strategy);
     BenchResult r;
     r.indices = indices;
+    r.slice_bytes.assign(indices.size(), 0);
+    r.pipeline_enabled = pipeline_config.enabled;
 
     auto t0 = std::chrono::high_resolution_clock::now();
-    auto slices = reader.read_slices_batch(axis, indices);
-    auto t_read_done = std::chrono::high_resolution_clock::now();
-    r.read_sec = std::chrono::duration<double>(t_read_done - t0).count();
-    r.n_read = slices.size();
-    r.slice_bytes.assign(slices.size(), 0);
+    if (!pipeline_config.enabled) {
+        std::vector<std::vector<float>> slices;
+        if (batch_read == "legacy") {
+            slices.reserve(indices.size());
+            for (uint64_t index : indices) slices.push_back(reader.read_slice(axis, index));
+        } else {
+            SliceBatchOptions options;
+            options.window_slices = batch_window_slices;
+            slices.resize(indices.size());
+            reader.read_slices_batch_stream(axis, indices, options,
+                [&](size_t request_pos, uint64_t, std::vector<float>&& slice) {
+                    slices[request_pos] = std::move(slice);
+                });
+        }
+        auto t_read_done = std::chrono::high_resolution_clock::now();
+        r.read_sec = std::chrono::duration<double>(t_read_done - t0).count();
+        r.producer_wall_sec = r.read_sec;
+        r.n_read = slices.size();
 
-    // A read-count mismatch is itself an I/O failure: do not write partial
-    // output and do not emit success metrics for this case.
-    if (slices.size() != indices.size()) {
-        std::cerr << "[ERROR] read_slices_batch returned " << slices.size()
-                  << " slices for " << indices.size()
-                  << " requested (axis=" << axis << ", mode=" << mode << ")\n";
-        r.io_error = true;
+        // A read-count mismatch is itself an I/O failure: do not write partial
+        // output and do not emit success metrics for this case.
+        if (slices.size() != indices.size()) {
+            std::cerr << "[ERROR] read_slices_batch returned " << slices.size()
+                      << " slices for " << indices.size()
+                      << " requested (axis=" << axis << ", mode=" << mode << ")\n";
+            r.io_error = true;
+            auto t1 = std::chrono::high_resolution_clock::now();
+            r.total_sec = std::chrono::duration<double>(t1 - t0).count();
+            r.write_sec = std::chrono::duration<double>(t1 - t_read_done).count();
+            return r;
+        }
+
+        auto t_write0 = std::chrono::high_resolution_clock::now();
+        for (size_t i = 0; i < slices.size(); i++) {
+            SliceJob job;
+            job.request_pos = i;
+            job.index = indices[i];
+            job.output_path = output_file_path(out_dir, ds_name, axis, mode, i, indices[i]);
+            job.data = std::move(slices[i]);
+
+            WriteResult wr = write_slice_file(job, output_sync);
+            if (!wr.ok) {
+                std::cerr << "[ERROR] write/sync/close failed for: " << job.output_path << "\n";
+                r.io_error = true;
+                continue;
+            }
+            r.slice_bytes[i] = wr.bytes;
+            r.total_bytes += wr.bytes;
+            r.n_written++;
+        }
+        auto t1 = std::chrono::high_resolution_clock::now();
+
+        r.write_sec = std::chrono::duration<double>(t1 - t_write0).count();
+        r.writer_service_sec = r.write_sec;
+        r.total_sec = std::chrono::duration<double>(t1 - t0).count();
+    } else {
+        PipelineRuntimeConfig runtime = make_pipeline_runtime(planned_slice_bytes, pipeline_config);
+        r.pipeline_memory_mb = pipeline_config.memory_mb;
+        r.pipeline_window_slices = runtime.read_window_slices;
+        r.pipeline_queue_slices = runtime.queue_capacity_slices;
+        r.pipeline_max_live_slices = runtime.max_live_slices;
+        r.pipeline_payload_peak_bound_bytes = static_cast<uint64_t>(runtime.max_live_slices) * planned_slice_bytes;
+        auto producer_done = t0;
+        std::exception_ptr producer_exception;
+        std::string first_error_path;
+
+        auto record_write = [&](const SliceJob& job, const WriteResult& wr, double service_sec) {
+            r.writer_service_sec += service_sec;
+            if (!wr.ok) {
+                if (first_error_path.empty()) first_error_path = wr.error_path;
+                r.io_error = true;
+                return;
+            }
+            if (job.request_pos < r.slice_bytes.size()) {
+                r.slice_bytes[job.request_pos] = wr.bytes;
+                r.total_bytes += wr.bytes;
+                r.n_written++;
+            } else {
+                if (first_error_path.empty()) first_error_path = job.output_path.string();
+                r.io_error = true;
+            }
+        };
+
+        if (runtime.queue_capacity_slices == 0) {
+            try {
+                auto consume_inline = [&](size_t request_pos, uint64_t index, std::vector<float>&& slice) {
+                    if (r.io_error) return;
+                    SliceJob job;
+                    job.request_pos = request_pos;
+                    job.index = index;
+                    job.output_path = output_file_path(out_dir, ds_name, axis, mode,
+                                                       request_pos, index);
+                    job.data = std::move(slice);
+                    r.n_read++;
+                    auto w0 = std::chrono::high_resolution_clock::now();
+                    WriteResult wr = write_slice_file(job, output_sync);
+                    auto w1 = std::chrono::high_resolution_clock::now();
+                    record_write(job, wr, std::chrono::duration<double>(w1 - w0).count());
+                };
+
+                if (batch_read == "legacy") {
+                    for (size_t i = 0; i < indices.size(); i++) {
+                        if (r.io_error) break;
+                        consume_inline(i, indices[i], reader.read_slice(axis, indices[i]));
+                    }
+                } else {
+                    SliceBatchOptions options;
+                    options.window_slices = runtime.read_window_slices;
+                    reader.read_slices_batch_stream(axis, indices, options, consume_inline);
+                }
+                producer_done = std::chrono::high_resolution_clock::now();
+            } catch (...) {
+                producer_exception = std::current_exception();
+                producer_done = std::chrono::high_resolution_clock::now();
+            }
+        } else {
+            BoundedSliceQueue queue(runtime.queue_capacity_slices);
+            std::atomic<bool> writer_failed{false};
+            std::mutex result_mutex;
+
+            auto writer = std::thread([&] {
+                SliceJob job;
+                while (queue.pop(job)) {
+                    auto w0 = std::chrono::high_resolution_clock::now();
+                    WriteResult wr = write_slice_file(job, output_sync);
+                    auto w1 = std::chrono::high_resolution_clock::now();
+
+                    std::lock_guard<std::mutex> lock(result_mutex);
+                    record_write(job, wr, std::chrono::duration<double>(w1 - w0).count());
+                    if (!wr.ok || job.request_pos >= r.slice_bytes.size()) {
+                        writer_failed.store(true);
+                        queue.cancel();
+                    }
+                }
+            });
+
+            try {
+                if (batch_read == "legacy") {
+                    for (size_t i = 0; i < indices.size(); i++) {
+                        if (writer_failed.load()) break;
+                        SliceJob job;
+                        job.request_pos = i;
+                        job.index = indices[i];
+                        job.output_path = output_file_path(out_dir, ds_name, axis, mode, i, indices[i]);
+                        job.data = reader.read_slice(axis, indices[i]);
+                        r.n_read++;
+                        double wait_sec = 0;
+                        if (!queue.push(std::move(job), wait_sec)) break;
+                        r.producer_wait_sec += wait_sec;
+                    }
+                } else {
+                    SliceBatchOptions options;
+                    options.window_slices = runtime.read_window_slices;
+                    reader.read_slices_batch_stream(axis, indices, options,
+                        [&](size_t request_pos, uint64_t index, std::vector<float>&& slice) {
+                            if (writer_failed.load()) return;
+                            SliceJob job;
+                            job.request_pos = request_pos;
+                            job.index = index;
+                            job.output_path = output_file_path(out_dir, ds_name, axis, mode,
+                                                               request_pos, index);
+                            job.data = std::move(slice);
+                            r.n_read++;
+                            double wait_sec = 0;
+                            if (!queue.push(std::move(job), wait_sec)) return;
+                            r.producer_wait_sec += wait_sec;
+                        });
+                }
+                producer_done = std::chrono::high_resolution_clock::now();
+                queue.close();
+            } catch (...) {
+                producer_exception = std::current_exception();
+                producer_done = std::chrono::high_resolution_clock::now();
+                queue.cancel();
+            }
+
+            writer.join();
+            r.queue_peak_slices = queue.peak_slices();
+            r.queue_peak_bytes = queue.peak_bytes();
+        }
         auto t1 = std::chrono::high_resolution_clock::now();
         r.total_sec = std::chrono::duration<double>(t1 - t0).count();
-        r.write_sec = std::chrono::duration<double>(t1 - t_read_done).count();
-        return r;
+        r.producer_wall_sec = std::chrono::duration<double>(producer_done - t0).count();
+        r.drain_sec = std::chrono::duration<double>(t1 - producer_done).count();
+        r.read_sec = r.producer_wall_sec;
+        r.write_sec = r.writer_service_sec;
+
+        if (producer_exception) {
+            r.io_error = true;
+            try {
+                std::rethrow_exception(producer_exception);
+            } catch (const std::exception& e) {
+                std::cerr << "[ERROR] producer failed: " << e.what() << "\n";
+            } catch (...) {
+                std::cerr << "[ERROR] producer failed with unknown exception\n";
+            }
+        }
+        if (r.io_error && !first_error_path.empty()) {
+            std::cerr << "[ERROR] write/sync/close failed for: " << first_error_path << "\n";
+        }
     }
 
-    for (size_t i = 0; i < slices.size(); i++) {
-        fs::path fp = output_file_path(out_dir, ds_name, axis, mode, i, indices[i]);
-        std::string fp_str = fp.string();
+    r.reader_pool_workers = reader.thread_pool_workers();
+    r.reader_pool_jobs = reader.thread_pool_jobs();
+    r.reader_pool_serial_fallbacks = reader.thread_pool_serial_fallbacks();
 
-        FILE* f = std::fopen(fp_str.c_str(), "wb");
-        if (!f) {
-            std::cerr << "[ERROR] cannot open output file: " << fp << "\n";
-            r.io_error = true;
-            continue;
-        }
-        const auto& sl = slices[i];
-        uint64_t bytes = sl.size() * sizeof(float);
-        // Per-slice success requires: full write, optional sync, clean close.
-        // Only on full success do we count this slice as written.
-        bool ok = std::fwrite(sl.data(), 1,
-                              static_cast<size_t>(bytes), f)
-                  == static_cast<size_t>(bytes);
-        if (ok && output_sync) ok = sync_output(f);
-        if (std::fclose(f) != 0) ok = false;
-        if (!ok) {
-            std::cerr << "[ERROR] write/sync/close failed for: " << fp << "\n";
-            r.io_error = true;
-            continue;
-        }
-        r.slice_bytes[i] = bytes;
-        r.total_bytes += bytes;
-        r.n_written++;
+    if (r.n_read != indices.size() || r.n_written != indices.size()) {
+        r.io_error = true;
+        std::cerr << "[ERROR] incomplete case axis=" << axis << " mode=" << mode
+                  << " requested=" << indices.size()
+                  << " read=" << r.n_read
+                  << " written=" << r.n_written << "\n";
     }
-    auto t1 = std::chrono::high_resolution_clock::now();
 
-    r.write_sec = std::chrono::duration<double>(t1 - t_read_done).count();
-    r.total_sec = std::chrono::duration<double>(t1 - t0).count();
     // Success metrics exist ONLY when every requested slice was written.
     if (!r.io_error && r.n_written > 0 && r.n_written == r.n_read
         && r.total_sec > 0) {
@@ -349,6 +697,23 @@ static void print_sep(const std::string& title) {
     std::cout << "\n" << std::string(70, '=') << "\n";
     std::cout << "  " << title << "\n";
     std::cout << std::string(70, '=') << "\n";
+}
+
+static void log_pipeline_result(const BenchResult& r) {
+    if (!r.pipeline_enabled) return;
+    std::cout << "TIMING_MODEL value=overlapped_pipeline\n";
+    std::cout << "PIPELINE_RESULT producer_wall_sec=" << r.producer_wall_sec
+              << " writer_service_sec=" << r.writer_service_sec
+              << " drain_sec=" << r.drain_sec
+              << " producer_wait_sec=" << r.producer_wait_sec
+              << " queue_peak_slices=" << r.queue_peak_slices
+              << " queue_peak_bytes=" << r.queue_peak_bytes
+              << " payload_peak_bound_bytes=" << r.pipeline_payload_peak_bound_bytes
+              << " memory_mb=" << r.pipeline_memory_mb
+              << " window_slices=" << r.pipeline_window_slices
+              << " queue_slices=" << r.pipeline_queue_slices
+              << " max_live_slices=" << r.pipeline_max_live_slices
+              << "\n";
 }
 
 static void log_per_slice_bytes(const BenchResult& r) {
@@ -408,6 +773,7 @@ static void print_bench_table(const std::string& title,
                   << ", written " << r.n_written << ", "
                   << size_str(r.total_bytes) << " written)\n";
         log_per_slice_bytes(r);
+        log_pipeline_result(r);
         std::cout << "BENCHMARK_RESULT cache=" << cache_name
                   << " mode=" << mode
                   << " axis=" << axes[i]
@@ -418,6 +784,9 @@ static void print_bench_table(const std::string& title,
                   << " slices_per_sec=" << r.throughput
                   << " count=" << r.n_written
                   << " bytes=" << r.total_bytes
+                  << " reader_pool_workers=" << r.reader_pool_workers
+                  << " reader_pool_jobs=" << r.reader_pool_jobs
+                  << " reader_pool_serial_fallbacks=" << r.reader_pool_serial_fallbacks
                   << " output_sync=" << (output_sync ? "requested" : "disabled")
                   << " plan_hash=" << std::hex << std::setw(16) << std::setfill('0')
                   << plan_hashes[i] << std::dec << std::setfill(' ') << "\n";
@@ -547,19 +916,36 @@ static void warm_up_for_plans(const std::string& b3d_path,
                               const std::vector<BenchCasePlan>& plans,
                               WarmupScope scope,
                               size_t stride,
-                              uint64_t memory_mb) {
+                              uint64_t memory_mb,
+                              const std::string& batch_read,
+                              size_t batch_window_slices,
+                              ReadDispatchStrategy dispatch_strategy) {
     auto t0 = std::chrono::high_resolution_clock::now();
     uint64_t bytes = 0;
     uint64_t checksum = 0;
     {
-        BlockedFileReader reader(b3d_path);
+        BlockedFileReader reader(b3d_path, 0, 0, dispatch_strategy);
         if (scope == WarmupScope::Dataset) {
             uint64_t bs = reader.block_size();
             bytes = reader.total_blocks() * bs * bs * bs * sizeof(float);
             reader.warm_up(false, stride, memory_mb);
         } else {
             for (const auto& plan : plans) {
-                auto slices = reader.read_slices_batch(plan.axis, plan.indices);
+                std::vector<std::vector<float>> slices;
+                if (batch_read == "legacy") {
+                    slices.reserve(plan.indices.size());
+                    for (uint64_t index : plan.indices) {
+                        slices.push_back(reader.read_slice(plan.axis, index));
+                    }
+                } else {
+                    SliceBatchOptions options;
+                    options.window_slices = batch_window_slices;
+                    slices.resize(plan.indices.size());
+                    reader.read_slices_batch_stream(plan.axis, plan.indices, options,
+                        [&](size_t request_pos, uint64_t, std::vector<float>&& slice) {
+                            slices[request_pos] = std::move(slice);
+                        });
+                }
                 for (const auto& slice : slices) {
                     bytes += slice.size() * sizeof(float);
                     if (!slice.empty()) {
@@ -664,7 +1050,11 @@ static int run_full_test(const std::string& ds_name,
                            const fs::path& run_dir,
                            const std::vector<char>& sel_axes,
                            const std::vector<std::string>& sel_modes,
-                           bool output_sync) {
+                           bool output_sync,
+                           const std::string& batch_read,
+                           size_t batch_window_slices,
+                           const PipelineConfig& pipeline_config,
+                           ReadDispatchStrategy dispatch_strategy) {
     print_sep("Dataset: " + ds_name + "  (" +
               std::to_string(cfg.dim_x) + "x" +
               std::to_string(cfg.dim_y) + "x" +
@@ -831,7 +1221,11 @@ static int run_full_test(const std::string& ds_name,
                 if (it == plans.end()) return false;
                 if (scrub_each_case && !run_cold_prepare(cache_options)) return false;
                 auto result = run_bench(b3d_path, it->axis, it->file_mode,
-                                        it->indices, phase_dir, ds_name, output_sync);
+                                        it->indices, phase_dir, ds_name, output_sync,
+                                        batch_read, batch_window_slices,
+                                        pipeline_config,
+                                        slice_bytes_for_axis(cfg, it->axis),
+                                        dispatch_strategy);
                 if (result.io_error) return false;
                 results.push_back(std::move(result));
                 hashes.push_back(it->plan_hash);
@@ -857,7 +1251,9 @@ static int run_full_test(const std::string& ds_name,
     if (cache_mode_has_hot(cache_options.mode)) {
         std::cout << "\n[Phase] Warm-up\n";
         warm_up_for_plans(b3d_path, plans, cache_options.warmup_scope,
-                          warmup_stride, warmup_memory_mb);
+                          warmup_stride, warmup_memory_mb,
+                          batch_read, batch_window_slices,
+                          dispatch_strategy);
         std::cout << "CACHE_PHASE name=hot_prefetched\n";
         if (!run_phase("hot_prefetched", hot_dir, false, hot_results)) return 1;
     }
@@ -898,6 +1294,9 @@ static void print_usage(const char* exe) {
               << "  --axis x|y|z|all --mode random|sequential|all\n"
               << "  --random-count N --seq-count N --seq-start N --seed N\n"
               << "  --cache-mode cold|hot|both\n"
+              << "  --batch-read legacy|fused --batch-window N\n"
+              << "  --pipeline off|on (default on) --pipeline-memory MB (default 256) --pipeline-window N (0=auto)\n"
+              << "  --read-dispatch round-robin|contiguous\n"
               << "  --cold-method scrub|none --cold-scrub-file FILE\n"
               << "  --cold-scrub-ratio R --cold-scrub-passes N --cold-settle-ms N\n"
               << "  --cold-isolation suite|case --warmup-scope dataset|workload\n"
@@ -926,6 +1325,12 @@ int main(int argc, char* argv[]) {
     bool output_sync = true; // default: request persistence
     std::string axis_arg = "all";
     std::string mode_arg = "all";
+    std::string batch_read = "fused";
+    int batch_window_arg = 4;
+    std::string pipeline = "on";
+    int pipeline_memory_mb = 256;
+    int pipeline_window_arg = 0;
+    std::string read_dispatch = "round-robin";
     uint64_t custom_dx = 0, custom_dy = 0, custom_dz = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -959,6 +1364,18 @@ int main(int argc, char* argv[]) {
             axis_arg = argv[++i];
         } else if (arg == "--mode" && i + 1 < argc) {
             mode_arg = argv[++i];
+        } else if (arg == "--batch-read" && i + 1 < argc) {
+            batch_read = argv[++i];
+        } else if (arg == "--batch-window" && i + 1 < argc) {
+            batch_window_arg = std::atoi(argv[++i]);
+        } else if (arg == "--pipeline" && i + 1 < argc) {
+            pipeline = argv[++i];
+        } else if (arg == "--pipeline-memory" && i + 1 < argc) {
+            pipeline_memory_mb = std::atoi(argv[++i]);
+        } else if (arg == "--pipeline-window" && i + 1 < argc) {
+            pipeline_window_arg = std::atoi(argv[++i]);
+        } else if (arg == "--read-dispatch" && i + 1 < argc) {
+            read_dispatch = argv[++i];
         } else if (arg == "--no-log") {
             no_log = true;
         } else if (arg == "--help" || arg == "-h") {
@@ -1061,6 +1478,31 @@ int main(int argc, char* argv[]) {
         std::cerr << "[ERROR] --cold-scrub-file is required when cold scrub is enabled\n";
         return 2;
     }
+    if (batch_read != "legacy" && batch_read != "fused") {
+        std::cerr << "[ERROR] invalid --batch-read: must be legacy|fused\n";
+        return 2;
+    }
+    if (batch_window_arg <= 0) {
+        std::cerr << "[ERROR] --batch-window must be > 0\n";
+        return 2;
+    }
+    if (pipeline != "off" && pipeline != "on") {
+        std::cerr << "[ERROR] invalid --pipeline: must be off|on\n";
+        return 2;
+    }
+    if (pipeline_memory_mb <= 0) {
+        std::cerr << "[ERROR] --pipeline-memory must be > 0\n";
+        return 2;
+    }
+    if (pipeline_window_arg < 0) {
+        std::cerr << "[ERROR] --pipeline-window must be >= 0 (0=auto)\n";
+        return 2;
+    }
+    if (read_dispatch != "round-robin" && read_dispatch != "contiguous") {
+        std::cerr << "[ERROR] invalid --read-dispatch: must be round-robin|contiguous\n";
+        return 2;
+    }
+    ReadDispatchStrategy dispatch_strategy = parse_dispatch_strategy(read_dispatch);
 
     std::vector<char> sel_axes;
     if (axis_arg == "all")      sel_axes = {'x', 'y', 'z'};
@@ -1140,6 +1582,19 @@ int main(int argc, char* argv[]) {
               << " cold_isolation=" << to_string(cache_options.cold_isolation)
               << " warmup_scope=" << to_string(cache_options.warmup_scope)
               << " timing_scope=read_write_total\n";
+    std::cout << "BATCH_READ mode=" << batch_read
+              << " window_slices=" << batch_window_arg << "\n";
+    PipelineConfig pipeline_config;
+    pipeline_config.enabled = pipeline == "on";
+    pipeline_config.memory_mb = static_cast<uint64_t>(pipeline_memory_mb);
+    pipeline_config.window_slices = static_cast<size_t>(pipeline_window_arg);
+
+    std::cout << "PIPELINE mode=" << pipeline
+              << " buffer_mb=" << (pipeline_config.enabled ? pipeline_config.memory_mb : 0)
+              << " window_slices=" << (pipeline_config.enabled ? pipeline_config.window_slices : 0)
+              << " queue_slices=auto writer_threads=" << (pipeline_config.enabled ? 1 : 0)
+              << "\n";
+    std::cout << "READ_DISPATCH strategy=" << normalize_dispatch(read_dispatch) << "\n";
     std::cout << "[OUTPUT-SYNC] output_sync="
               << (output_sync ? "requested" : "disabled") << "\n";
     std::cout << "[CASE-PLAN] axis=" << axis_arg << " mode=" << mode_arg
@@ -1205,7 +1660,11 @@ int main(int argc, char* argv[]) {
                             run_dir,
                             sel_axes,
                             sel_modes,
-                            output_sync);
+                            output_sync,
+                            batch_read,
+                            static_cast<size_t>(batch_window_arg),
+                            pipeline_config,
+                            dispatch_strategy);
         if (ret != 0) break;
     }
 

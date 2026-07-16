@@ -1,0 +1,20 @@
+cache,mode,axis,round_robin_median_sec,contiguous_median_sec,contiguous_vs_round_robin
+cold_scrubbed,random,x,5.761000,5.614000,0.974484
+cold_scrubbed,random,y,7.759000,7.132000,0.919191
+cold_scrubbed,random,z,4.204000,6.628000,1.576594
+cold_scrubbed,sequential,x,0.250000,0.427000,1.708000
+cold_scrubbed,sequential,y,0.095000,0.147000,1.547368
+cold_scrubbed,sequential,z,0.108000,0.095000,0.879630
+hot_prefetched,random,x,1.909000,1.966000,1.029859
+hot_prefetched,random,y,1.734000,1.723000,0.993656
+hot_prefetched,random,z,2.794000,2.381000,0.852183
+hot_prefetched,sequential,x,0.232000,0.245000,1.056034
+hot_prefetched,sequential,y,0.097000,0.105000,1.082474
+hot_prefetched,sequential,z,0.099000,0.112000,1.131313
+
+overall_round_robin_mean_of_medians_sec=2.086833
+overall_contiguous_mean_of_medians_sec=2.214583
+overall_contiguous_vs_round_robin=1.061217
+worst_contiguous_regression=0.708000
+
+DECISION=keep_round_robin (contiguous did not meet configured switch thresholds)

@@ -8,6 +8,8 @@
 #include <utility>
 #include <future>
 #include <atomic>
+#include <functional>
+#include <memory>
 #include "core.hpp"
 #include "rng.hpp"
 
@@ -55,11 +57,33 @@ struct BlockCoord {
     uint32_t bx, by_, bz;
 };
 
+enum class ReadDispatchStrategy {
+    RoundRobin,
+    Contiguous,
+};
+
+struct SliceBatchOptions {
+    int num_threads = 0;
+    size_t window_slices = 1;
+};
+
+using SliceConsumer = std::function<void(
+    size_t request_pos,
+    uint64_t index,
+    std::vector<float>&& slice)>;
+
 class BlockedFileReader {
 public:
     BlockedFileReader(const std::string& file_path,
                       int num_threads = 0,
-                      uint64_t max_memory_mb = 0);
+                      uint64_t max_memory_mb = 0,
+                      ReadDispatchStrategy dispatch_strategy = ReadDispatchStrategy::RoundRobin);
+    ~BlockedFileReader();
+
+    BlockedFileReader(const BlockedFileReader&) = delete;
+    BlockedFileReader& operator=(const BlockedFileReader&) = delete;
+    BlockedFileReader(BlockedFileReader&&) = delete;
+    BlockedFileReader& operator=(BlockedFileReader&&) = delete;
 
     std::vector<float> read_x_slice(uint64_t x);
     std::vector<float> read_y_slice(uint64_t y);
@@ -69,6 +93,10 @@ public:
     std::vector<std::vector<float>>
     read_slices_batch(char axis, const std::vector<uint64_t>& indices,
                       int num_threads = 0);
+    void read_slices_batch_stream(char axis,
+                                  const std::vector<uint64_t>& indices,
+                                  const SliceBatchOptions& options,
+                                  const SliceConsumer& consumer);
 
     std::vector<float> read_x_column(uint64_t y, uint64_t z);
     std::vector<float> read_y_column(uint64_t x, uint64_t z);
@@ -109,6 +137,10 @@ public:
     uint64_t     data_offset() const { return data_offset_; }
     int          num_threads() const { return num_threads_; }
     uint64_t     max_memory_mb() const { return max_memory_mb_; }
+    size_t       thread_pool_workers() const;
+    uint64_t     thread_pool_jobs() const;
+    uint64_t     thread_pool_serial_fallbacks() const;
+    ReadDispatchStrategy read_dispatch_strategy() const { return dispatch_strategy_; }
     const BlockLayout3D& layout() const { return layout_; }
 
 private:
@@ -118,6 +150,7 @@ private:
     uint64_t data_offset_ = 0;
     int num_threads_ = 1;
     uint64_t max_memory_mb_ = 0;
+    ReadDispatchStrategy dispatch_strategy_ = ReadDispatchStrategy::RoundRobin;
 
     BlockLayout3D   layout_;
     MappedFile      mapped_file_;
@@ -147,6 +180,9 @@ private:
     std::list<CacheKey> cache_order_;
     std::mutex cache_mutex_;
 
+    class ThreadPool;
+    std::unique_ptr<ThreadPool> thread_pool_;
+
     std::future<void> warm_up_future_;
     std::atomic<bool> warm_up_done_{false};
 
@@ -158,6 +194,13 @@ private:
     // result, so an internal reference could dangle after a rehash/prune or a
     // concurrent overwrite of the same key.
     std::vector<BlockCoord> sorted_block_list(char axis, uint64_t index);
+
+    template<typename F>
+    void for_each_block_parallel(int requested_threads,
+                                 const std::vector<BlockCoord>& blocks,
+                                 F&& process);
+    template<typename F>
+    void for_each_block_parallel(const std::vector<BlockCoord>& blocks, F&& process);
 
 };
 
