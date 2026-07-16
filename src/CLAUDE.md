@@ -12,7 +12,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - `converter.cpp` 必须把逻辑块偏移写入按 X-Y-Z 排列的索引表，同时按 Morton 顺序写块数据。
 - 每个物理块长度固定为 `block_size^3 * sizeof(float)`；边界块先清零再复制有效区域。
-- OpenMP 只并行块提取，输出流保持顺序单线程写入。
+- OpenMP 并行块提取，输出流保持顺序单线程写入。转换采用双缓冲流水线：batch N 写入的同时 batch N+1 由 `std::async` + OpenMP 异步提取，重叠 I/O 与 CPU。
 - `max_memory_mb` 目前只约束块池批次；不要把它描述成完整进程硬限制。
 - block_size 未显式指定时默认自适应选择：`detect_storage_medium()` 探测输出目录介质类型，`auto_block_size()` 根据维度+介质计算最优值（16–256，步长 8）。探测临时文件写入后立即清理。
 

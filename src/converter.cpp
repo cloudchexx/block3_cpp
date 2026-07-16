@@ -7,6 +7,7 @@
 #include <iostream>
 #include <thread>
 #include <atomic>
+#include <future>
 
 #ifdef OMP_ENABLED
 #include <omp.h>
@@ -135,37 +136,80 @@ void convert_raw_to_blocked(
         }
     };
 
-    std::vector<float> block_pool(batch_size * layout.block_floats);
+    // -- Double-buffered pipeline ----------------------------------------
+    // Two block pools so extraction of batch N+1 can overlap with the
+    // (sequential, I/O-bound) write of batch N.  The first batch is
+    // extracted synchronously; every subsequent batch is extracted via
+    // std::async while the main thread writes the previous batch.
+    std::vector<float> block_pool[2];
+    block_pool[0].resize(batch_size * layout.block_floats);
+    block_pool[1].resize(batch_size * layout.block_floats);
 
-    for (size_t batch_start = 0; batch_start < total;
-         batch_start += batch_size) {
-        size_t batch_end = std::min(batch_start + batch_size, total);
-        size_t batch_len = batch_end - batch_start;
+    std::vector<BlockData> batch_data[2];
 
-        std::vector<BlockData> batch_data(batch_len);
-
+    auto extract_batch = [&](size_t start, size_t len,
+                              std::vector<float>& pool,
+                              std::vector<BlockData>& meta) {
+        meta.resize(len);
 #ifdef OMP_ENABLED
         #pragma omp parallel for num_threads(num_threads)
 #endif
-        for (int64_t i = 0; i < static_cast<int64_t>(batch_len); i++) {
-            auto [bx, by_, bz] = ordered_blocks[batch_start + i];
-            batch_data[i].linear_idx =
-                layout.linear_index(bx, by_, bz);
-            float* dst = block_pool.data() + i * layout.block_floats;
+        for (int64_t i = 0; i < static_cast<int64_t>(len); i++) {
+            auto [bx, by_, bz] = ordered_blocks[start + i];
+            meta[i].linear_idx = layout.linear_index(bx, by_, bz);
+            float* dst = pool.data() + i * layout.block_floats;
             extract_block(bx, by_, bz, raw_3d,
                           dim_x, dim_y, dim_z, bs, dst);
         }
+    };
 
-        for (size_t i = 0; i < batch_len; i++) {
+    auto write_batch = [&](const std::vector<BlockData>& meta,
+                            const std::vector<float>& pool,
+                            size_t len) {
+        for (size_t i = 0; i < len; i++) {
             uint64_t off = static_cast<uint64_t>(out.tellp());
-            block_offsets[batch_data[i].linear_idx] = off;
-            const float* src = block_pool.data() + i * layout.block_floats;
+            block_offsets[meta[i].linear_idx] = off;
+            const float* src = pool.data() + i * layout.block_floats;
             out.write(
                 reinterpret_cast<const char*>(src),
                 static_cast<std::streamsize>(layout.block_bytes));
             done++;
             print_progress("Converting");
         }
+    };
+
+    // Phase 0: extract first batch (nothing to overlap with).
+    size_t first_len = std::min(batch_size, total);
+    extract_batch(0, first_len, block_pool[0], batch_data[0]);
+
+    // Phase 1..N-1: pipeline -- extract batch N while writing batch N-1.
+    // bi is the 1-based batch index within the pipeline loop.
+    for (size_t bs = batch_size, bi = 1; bs < total; bs += batch_size, bi++) {
+        size_t len = std::min(batch_size, total - bs);
+        int write_idx   = static_cast<int>((bi - 1) % 2);
+        int extract_idx = static_cast<int>(bi % 2);
+
+        auto fut = std::async(std::launch::async, [&]() {
+            extract_batch(bs, len,
+                          block_pool[extract_idx], batch_data[extract_idx]);
+        });
+
+        // Write the *previous* batch (I/O on main thread) concurrently
+        // with the async extraction above.
+        size_t prev_len = std::min(batch_size, total - (bs - batch_size));
+        write_batch(batch_data[write_idx], block_pool[write_idx], prev_len);
+
+        fut.get();
+    }
+
+    // Phase final: write the last batch.
+    {
+        size_t num_batches = (total + batch_size - 1) / batch_size;
+        size_t last_start  = (num_batches > 0) ? (num_batches - 1) * batch_size : 0;
+        size_t last_len    = total - last_start;
+        int    last_pool   = (num_batches > 0)
+                             ? static_cast<int>((num_batches - 1) % 2) : 0;
+        write_batch(batch_data[last_pool], block_pool[last_pool], last_len);
     }
 
     if (progress) std::cout << "\n";

@@ -19,12 +19,12 @@ MappedFile(raw)
  -> write FileHeader
  -> reserve logical offset table
  -> align data area
- -> batch extract blocks (OpenMP when available)
- -> sequentially write Morton-ordered blocks
+ -> double-buffered pipeline:
+    extract batch N+1 (std::async + OpenMP) || write batch N (sequential I/O)
  -> backfill logical offset table
 ```
 
-块提取可并行，文件写入串行。`max_memory_mb` 只参与批次大小计算。
+块提取可并行，文件写入串行。双缓冲使 CPU 提取与磁盘 I/O 重叠。`max_memory_mb` 只参与批次大小计算。
 
 CLI 层（`cli.cpp` 和 `run_test.cpp`）在未显式指定 `--block-size` 时默认调用 `detect_storage_medium()` + `auto_block_size()`，根据实际硬件自适应选择块大小。
 
