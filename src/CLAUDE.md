@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### 转换
 
 - `converter.cpp` 必须把逻辑块偏移写入按 X-Y-Z 排列的索引表，同时按 Morton 顺序写块数据。
-- 每个物理块长度固定为 `block_size^3 * sizeof(float)`；边界块先清零再复制有效区域。
+- 每个物理块长度固定为 `block_size^3 * sizeof(float)`；边界块先清零再复制有效区域。v1 legacy 按局部 X-Y-Z 写入；v2 micro-tiled 按固定 8³ micro tile 写入，且要求 `block_size % 8 == 0`。
 - OpenMP 并行块提取，输出流保持顺序单线程写入。转换采用双缓冲流水线：batch N 写入的同时 batch N+1 由 `std::async` + OpenMP 异步提取，重叠 I/O 与 CPU。
 - `max_memory_mb` 目前只约束块池批次；不要把它描述成完整进程硬限制。
 - block_size 未显式指定时默认自适应选择：`detect_storage_medium()` 探测输出目录介质类型，`auto_block_size()` 根据维度+介质计算最优值（16–256，步长 8）。探测临时文件写入后立即清理。
@@ -39,9 +39,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `block3d_cli bench` 计时范围为 `read_only`，不写结果；`run_test` 计时范围为 `read_write_total`，主指标 `total_sec` 含切片读取、输出文件写入/关闭和可选 `_commit`/`fsync`。
 - `run_test both` 必须使用独立 phase 目录（`cold_scrubbed/`、`hot_prefetched/` 或 `cold_first_touch/`），运行前估算输出空间，完成后逐文件校验 cold/hot 输出一致；日志默认保存到当前工作目录 `logs/` 且包含 stderr。
 - `--warm-up` 标志（`bench` 和 `run_test` 均支持）在计时前将数据区预加载到 OS 页缓存；预热后的测量结果是热缓存数据。
-- `convert` 的 `--block-size` 默认值为 0（自动检测）；显式 N 可覆盖。`--block-size 0` 与省略等效。验证区间为 0 或 16–256。
+- `convert` 的 `--block-size` 默认值为 0（自动检测）；显式 N 可覆盖。`--block-size 0` 与省略等效。验证区间为 0 或 16–256。`--layout legacy|micro-tiled` 控制块内布局；默认 legacy，micro-tiled 第一版只接受 `--micro-size 8`。
 - `run_test` 默认正式路径为 `batch_read=fused`、`pipeline=on`、`pipeline_memory=256MiB`、`pipeline_window=auto`、单 writer、`output_sync=requested`、`read_dispatch=round-robin`；该 dispatch 默认已由 2026-07-17 test18/test50 各 3 轮 A/B 中位数固定，`--pipeline off`、`--batch-read legacy` 和 `--read-dispatch contiguous` 仅用于诊断、A/B 或回滚。
-- Phase 5 默认路径的正式日志与派生 CSV 已归档在 `../experiments/phase5_20260717/`；修改 benchmark 输出字段或默认路径时，同步考虑该归档说明是否需要补充新实验。
+- Phase 5 默认路径的正式日志与派生 CSV 已归档在 `../experiments/批量融合读取与读写流水线优化开发方案实验数据归档/`；修改 benchmark 输出字段或默认路径时，同步考虑该归档说明是否需要补充新实验。
+- Phase 6 micro-tiled v2 的正式日志与派生 CSV 已归档在 `../experiments/phase6_20260717/`；修改 v2 读取/转换性能路径时，优先用 `run_test --b3d-file` 对 micro8 文件做可比复测。
 - `run_test` 除内置 `test18`/`test50` 外，支持自定义数据集：未识别的名称通过 `--dim-x/--dim-y/--dim-z` 指定维度，文件自动推导为 `{name}.dat` / `{name}.b3d`。
 
 ## 构建与验证

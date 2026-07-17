@@ -17,4 +17,5 @@ This file provides guidance to Claude Code (claude.ai/code) when working with ex
 
 ## 当前归档
 
-- `phase5_20260717/`：Phase 5 默认路径收敛、test18/test50 正式验证和 round-robin/contiguous dispatch A/B 证据。
+- `批量融合读取与读写流水线优化开发方案实验数据归档/`：Phase 5 默认路径收敛、test18/test50 正式验证和 round-robin/contiguous dispatch A/B 证据。
+- `phase6_20260717/`：块内微分块 v2 / micro8 正式 A/B 证据，包含原实现方案归档、日志副本和派生 CSV。

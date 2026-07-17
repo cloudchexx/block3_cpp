@@ -3,7 +3,11 @@
 ## `types.hpp` — 磁盘格式
 
 - `FileHeader`：固定 64 字节的 `.b3d` 头。
-- `MAGIC = "3DBK"`、`VERSION = 1`。
+- `MAGIC = "3DBK"`、`VERSION_LEGACY = 1`、`VERSION_MICROTILE = 2`、`VERSION = VERSION_LEGACY`。
+- `LAYOUT_LEGACY_XYZ = 0`、`LAYOUT_MICRO_TILED_XYZ = 1`、`DEFAULT_MICRO_SIZE = 8`。
+- `BlockInnerLayout`：块内布局枚举，支持 legacy XYZ 和 v2 micro-tiled XYZ。
+- `encode_layout()` / `header_layout_kind()` / `header_micro_size()`：在 `FileHeader::reserved` 中编码/解析 v2 layout metadata。
+- `legacy_local_offset()` / `micro_tiled_local_offset()` / `local_offset_for_layout()`：布局感知块内 float offset helper。
 - `HEADER_SIZE`、`PAGE_ALIGN = 4096`。
 - `aligned_data_offset(total_blocks)`：计算头和 `uint64_t` 索引表之后的数据区对齐位置。
 - `str_axis()`：CLI 输出文件名和消息使用的轴字符串。
@@ -56,12 +60,17 @@ block_bytes = block_floats * 4
 ## `converter.hpp` — 转换入口
 
 ```cpp
+ConvertOptions{
+  block_size, num_threads, progress, max_memory_mb,
+  inner_layout, micro_size
+}
+convert_raw_to_blocked(raw, output, dx, dy, dz, options)
 convert_raw_to_blocked(raw, output, dx, dy, dz,
                        block_size, num_threads,
-                       progress, max_memory_mb)
+                       progress, max_memory_mb)  // legacy-compatible overload
 ```
 
-只提供 `.dat -> .b3d`。`max_memory_mb` 是转换批次预算，不是进程硬上限。
+只提供 `.dat -> .b3d`。默认仍生成 v1 legacy；显式 `inner_layout=MicroTiledXYZ` 且 `micro_size=8` 生成 v2 micro-tiled。Phase 6 A/B 归档显示 micro8 在当前 test18/test50 综合 run_test 计划下总体通过，但 X-heavy 负载仍可能退化，因此调用方应显式选择布局。`max_memory_mb` 是转换批次预算，不是进程硬上限。
 
 ## `reader.hpp` — 读取接口
 
@@ -72,13 +81,13 @@ convert_raw_to_blocked(raw, output, dx, dy, dz,
 ### `BlockedFileReader`
 
 - 切片：`read_x/y/z_slice()`、`read_slice()`、`read_slices_batch()`、`read_slices_batch_stream()`。批量入口先校验 axis 和整批 index，再按 layer/window 融合读取；兼容 API 按 `request_pos` 收集，保持请求顺序和重复语义。
-- 块分发策略：`ReadDispatchStrategy::RoundRobin` / `Contiguous`，由 `BlockedFileReader` 构造参数固定；CLI 的 `--read-dispatch round-robin|contiguous` 用于 A/B 和回滚，不改变 `.b3d` 格式或输出语义。2026-07-17 Phase 5 归档证据位于 `../../experiments/phase5_20260717/`，正式默认策略保持 round-robin。
+- 块分发策略：`ReadDispatchStrategy::RoundRobin` / `Contiguous`，由 `BlockedFileReader` 构造参数固定；CLI 的 `--read-dispatch round-robin|contiguous` 用于 A/B 和回滚，不改变 `.b3d` 格式或输出语义。2026-07-17 Phase 5 归档证据位于 `../../experiments/批量融合读取与读写流水线优化开发方案实验数据归档/`，正式默认策略保持 round-robin。
 - 列：`read_x/y/z_column()` 及批量版本。
 - 区域：`read_subvolume()`、`read_full_volume()`。
 - 点与校验：`read_point()`、`verify()`。
 - 缓存预热：`warm_up()`、`wait_warm_up()`。
 - reader 生命周期持久线程池：切片和 fused batch 的块级并行复用构造时创建的 worker；可按 reader 的 dispatch strategy 使用 round-robin 或 contiguous physical chunks，`options.num_threads` 作为单次调用 worker 上限。
-- 元数据：尺寸、块大小、块总数、数据偏移、布局 getter，以及 `thread_pool_workers()` / `thread_pool_jobs()` / `thread_pool_serial_fallbacks()` 诊断 getter。
+- 元数据：尺寸、块大小、块总数、数据偏移、格式 `version()`、块内 `inner_layout()`、`micro_size()`、布局 getter，以及 `thread_pool_workers()` / `thread_pool_jobs()` / `thread_pool_serial_fallbacks()` 诊断 getter。
 
 ## `benchmark_cache.hpp` — 冷/热缓存 benchmark 接口
 

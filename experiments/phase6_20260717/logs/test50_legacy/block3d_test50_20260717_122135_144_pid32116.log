@@ -1,0 +1,145 @@
+Log saved to: logs/block3d_test50_20260717_122135_144_pid32116.log
+
+CACHE_CONFIG mode=both cold_method=scrub cold_isolation=suite warmup_scope=workload timing_scope=read_write_total
+BATCH_READ mode=fused window_slices=4
+PIPELINE mode=on buffer_mb=256 window_slices=0 queue_slices=auto writer_threads=1
+READ_DISPATCH strategy=round_robin
+[OUTPUT-SYNC] output_sync=requested
+[CASE-PLAN] axis=all mode=all cold_isolation=suite
+[VERIFY-MODE] verify=skipped
+
+
+======================================================================
+  Dataset: test50  (2002x2202x3001)
+======================================================================
+[AUTO-BS] Detected NVMe storage, auto block_size=64
+[SKIP] test50: 'Z:\wutan\block3d-data\test50.b3d' already exists (51.41 GB), valid format
+
+[CONFIG] seed=42 (fixed for random reads)
+         threads=16 (auto)
+         run_dir=Z:\wutan\block3d-data\phase5_outputs\test50_20260717_122133\round_robin\round_1\20260717_122135_144_pid32116
+         output_pattern=<phase>/test50_<axis>_<mode>_<seq>_<idx>.raw
+         output_sync=requested
+         timing_scope=read_write_total
+CACHE_CONFIG mode=both cold_method=scrub cold_isolation=suite warmup_scope=workload timing_scope=read_write_total
+TIMING_SCOPE value=read_write_total
+PLAN_HASH_SUITE value=5bc463ef8b4289a1
+PLAN_HASH axis=x mode=random value=8b91a9e0f840b280 count=100
+PLAN_HASH axis=y mode=random value=beb82312af1110d9 count=100
+PLAN_HASH axis=z mode=random value=e31dc0f5a2a371c5 count=100
+PLAN_HASH axis=x mode=sequential value=1665cbc72a2c1b90 count=10
+PLAN_HASH axis=y mode=sequential value=cd37d91f37db20eb count=10
+PLAN_HASH axis=z mode=sequential value=94a80cbf971ae4d6 count=10
+OUTPUT_SPACE estimated_bytes=14981655040 available_bytes=345716088832
+
+CACHE_PHASE name=cold_scrubbed
+[Phase] Cache scrub
+CACHE_SCRUB method=unrelated_file_sweep
+CACHE_SCRUB file=Z:\wutan\block3d-cache\scrub.bin
+CACHE_SCRUB bytes=50427377664 file_bytes=50427377664 required_bytes=50427377664 ram_ratio=1.5 passes=1
+CACHE_SCRUB elapsed_sec=74.7064 checksum=1569955852
+CACHE_VALIDITY state=scrub_success
+
+[RANDOM]
+         Axis       Total         Avg    Throughput
+         ------ -------- ---------- ------------
+         X         5.735s     57.35ms        17.4 slices/s  (read_sec=5.692s, write_sec=4.231s, read 100, written 100, 2.46 GB written)
+         per-slice bytes: 26432808 x100 (uniform), total=2643280800
+TIMING_MODEL value=overlapped_pipeline
+PIPELINE_RESULT producer_wall_sec=5.692 writer_service_sec=4.231 drain_sec=0.042 producer_wait_sec=0.000 queue_peak_slices=4 queue_peak_bytes=105731232 payload_peak_bound_bytes=264328080 memory_mb=256 window_slices=4 queue_slices=6 max_live_slices=10
+BENCHMARK_RESULT cache=cold_scrubbed mode=random axis=x total_sec=5.735 read_sec=5.692 write_sec=4.231 avg_ms=57.347 slices_per_sec=17.438 count=100 bytes=2643280800 reader_pool_workers=16 reader_pool_jobs=39 reader_pool_serial_fallbacks=0 output_sync=requested plan_hash=8b91a9e0f840b280
+         Y        36.711s    367.11ms         2.7 slices/s  (read_sec=36.694s, write_sec=5.973s, read 100, written 100, 2.24 GB written)
+         per-slice bytes: 24032008 x100 (uniform), total=2403200800
+TIMING_MODEL value=overlapped_pipeline
+PIPELINE_RESULT producer_wall_sec=36.694 writer_service_sec=5.973 drain_sec=0.017 producer_wait_sec=0.000 queue_peak_slices=4 queue_peak_bytes=96128032 payload_peak_bound_bytes=264352088 memory_mb=256 window_slices=4 queue_slices=7 max_live_slices=11
+BENCHMARK_RESULT cache=cold_scrubbed mode=random axis=y total_sec=36.711 read_sec=36.694 write_sec=5.973 avg_ms=367.111 slices_per_sec=2.724 count=100 bytes=2403200800 reader_pool_workers=16 reader_pool_jobs=40 reader_pool_serial_fallbacks=0 output_sync=requested plan_hash=beb82312af1110d9
+         Z        21.884s    218.84ms         4.6 slices/s  (read_sec=21.871s, write_sec=3.843s, read 100, written 100, 1.64 GB written)
+         per-slice bytes: 17633616 x100 (uniform), total=1763361600
+TIMING_MODEL value=overlapped_pipeline
+PIPELINE_RESULT producer_wall_sec=21.871 writer_service_sec=3.843 drain_sec=0.013 producer_wait_sec=0.000 queue_peak_slices=4 queue_peak_bytes=70534464 payload_peak_bound_bytes=264504240 memory_mb=256 window_slices=4 queue_slices=11 max_live_slices=15
+BENCHMARK_RESULT cache=cold_scrubbed mode=random axis=z total_sec=21.884 read_sec=21.871 write_sec=3.843 avg_ms=218.842 slices_per_sec=4.570 count=100 bytes=1763361600 reader_pool_workers=16 reader_pool_jobs=42 reader_pool_serial_fallbacks=0 output_sync=requested plan_hash=e31dc0f5a2a371c5
+         ------------------------------------------
+         Avg         214.43ms  balance=6.40x  (over 3 axes)
+
+[SEQUENTIAL]
+         Axis       Total         Avg    Throughput
+         ------ -------- ---------- ------------
+         X         0.303s     30.32ms        33.0 slices/s  (read_sec=0.198s, write_sec=0.231s, read 10, written 10, 0.25 GB written)
+         per-slice bytes: 26432808 x10 (uniform), total=264328080
+TIMING_MODEL value=overlapped_pipeline
+PIPELINE_RESULT producer_wall_sec=0.198 writer_service_sec=0.231 drain_sec=0.105 producer_wait_sec=0.000 queue_peak_slices=5 queue_peak_bytes=132164040 payload_peak_bound_bytes=264328080 memory_mb=256 window_slices=4 queue_slices=6 max_live_slices=10
+BENCHMARK_RESULT cache=cold_scrubbed mode=sequential axis=x total_sec=0.303 read_sec=0.198 write_sec=0.231 avg_ms=30.322 slices_per_sec=32.979 count=10 bytes=264328080 reader_pool_workers=16 reader_pool_jobs=3 reader_pool_serial_fallbacks=0 output_sync=requested plan_hash=1665cbc72a2c1b90
+         Y         0.434s     43.36ms        23.1 slices/s  (read_sec=0.311s, write_sec=0.156s, read 10, written 10, 0.22 GB written)
+         per-slice bytes: 24032008 x10 (uniform), total=240320080
+TIMING_MODEL value=overlapped_pipeline
+PIPELINE_RESULT producer_wall_sec=0.311 writer_service_sec=0.156 drain_sec=0.123 producer_wait_sec=0.000 queue_peak_slices=7 queue_peak_bytes=168224056 payload_peak_bound_bytes=264352088 memory_mb=256 window_slices=4 queue_slices=7 max_live_slices=11
+BENCHMARK_RESULT cache=cold_scrubbed mode=sequential axis=y total_sec=0.434 read_sec=0.311 write_sec=0.156 avg_ms=43.356 slices_per_sec=23.065 count=10 bytes=240320080 reader_pool_workers=16 reader_pool_jobs=3 reader_pool_serial_fallbacks=0 output_sync=requested plan_hash=cd37d91f37db20eb
+         Z         0.473s     47.25ms        21.2 slices/s  (read_sec=0.382s, write_sec=0.141s, read 10, written 10, 0.16 GB written)
+         per-slice bytes: 17633616 x10 (uniform), total=176336160
+TIMING_MODEL value=overlapped_pipeline
+PIPELINE_RESULT producer_wall_sec=0.382 writer_service_sec=0.141 drain_sec=0.090 producer_wait_sec=0.000 queue_peak_slices=7 queue_peak_bytes=123435312 payload_peak_bound_bytes=264504240 memory_mb=256 window_slices=4 queue_slices=11 max_live_slices=15
+BENCHMARK_RESULT cache=cold_scrubbed mode=sequential axis=z total_sec=0.473 read_sec=0.382 write_sec=0.141 avg_ms=47.255 slices_per_sec=21.162 count=10 bytes=176336160 reader_pool_workers=16 reader_pool_jobs=3 reader_pool_serial_fallbacks=0 output_sync=requested plan_hash=94a80cbf971ae4d6
+         ------------------------------------------
+         Avg          40.31ms  balance=1.56x  (over 3 axes)
+
+[Phase] Warm-up
+WARMUP_RESULT scope=workload elapsed_sec=61.31 bytes=7490827520 checksum=433928
+CACHE_PHASE name=hot_prefetched
+
+[RANDOM]
+         Axis       Total         Avg    Throughput
+         ------ -------- ---------- ------------
+         X         4.543s     45.43ms        22.0 slices/s  (read_sec=4.501s, write_sec=4.091s, read 100, written 100, 2.46 GB written)
+         per-slice bytes: 26432808 x100 (uniform), total=2643280800
+TIMING_MODEL value=overlapped_pipeline
+PIPELINE_RESULT producer_wall_sec=4.501 writer_service_sec=4.091 drain_sec=0.042 producer_wait_sec=0.000 queue_peak_slices=5 queue_peak_bytes=132164040 payload_peak_bound_bytes=264328080 memory_mb=256 window_slices=4 queue_slices=6 max_live_slices=10
+BENCHMARK_RESULT cache=hot_prefetched mode=random axis=x total_sec=4.543 read_sec=4.501 write_sec=4.091 avg_ms=45.435 slices_per_sec=22.010 count=100 bytes=2643280800 reader_pool_workers=16 reader_pool_jobs=39 reader_pool_serial_fallbacks=0 output_sync=requested plan_hash=8b91a9e0f840b280
+         Y        39.227s    392.27ms         2.5 slices/s  (read_sec=39.207s, write_sec=7.160s, read 100, written 100, 2.24 GB written)
+         per-slice bytes: 24032008 x100 (uniform), total=2403200800
+TIMING_MODEL value=overlapped_pipeline
+PIPELINE_RESULT producer_wall_sec=39.207 writer_service_sec=7.160 drain_sec=0.020 producer_wait_sec=0.000 queue_peak_slices=4 queue_peak_bytes=96128032 payload_peak_bound_bytes=264352088 memory_mb=256 window_slices=4 queue_slices=7 max_live_slices=11
+BENCHMARK_RESULT cache=hot_prefetched mode=random axis=y total_sec=39.227 read_sec=39.207 write_sec=7.160 avg_ms=392.268 slices_per_sec=2.549 count=100 bytes=2403200800 reader_pool_workers=16 reader_pool_jobs=40 reader_pool_serial_fallbacks=0 output_sync=requested plan_hash=beb82312af1110d9
+         Z        24.543s    245.43ms         4.1 slices/s  (read_sec=24.530s, write_sec=4.839s, read 100, written 100, 1.64 GB written)
+         per-slice bytes: 17633616 x100 (uniform), total=1763361600
+TIMING_MODEL value=overlapped_pipeline
+PIPELINE_RESULT producer_wall_sec=24.530 writer_service_sec=4.839 drain_sec=0.014 producer_wait_sec=0.000 queue_peak_slices=4 queue_peak_bytes=70534464 payload_peak_bound_bytes=264504240 memory_mb=256 window_slices=4 queue_slices=11 max_live_slices=15
+BENCHMARK_RESULT cache=hot_prefetched mode=random axis=z total_sec=24.543 read_sec=24.530 write_sec=4.839 avg_ms=245.432 slices_per_sec=4.074 count=100 bytes=1763361600 reader_pool_workers=16 reader_pool_jobs=42 reader_pool_serial_fallbacks=0 output_sync=requested plan_hash=e31dc0f5a2a371c5
+         ------------------------------------------
+         Avg         227.71ms  balance=8.63x  (over 3 axes)
+
+[SEQUENTIAL]
+         Axis       Total         Avg    Throughput
+         ------ -------- ---------- ------------
+         X         0.401s     40.13ms        24.9 slices/s  (read_sec=0.295s, write_sec=0.335s, read 10, written 10, 0.25 GB written)
+         per-slice bytes: 26432808 x10 (uniform), total=264328080
+TIMING_MODEL value=overlapped_pipeline
+PIPELINE_RESULT producer_wall_sec=0.295 writer_service_sec=0.335 drain_sec=0.106 producer_wait_sec=0.000 queue_peak_slices=5 queue_peak_bytes=132164040 payload_peak_bound_bytes=264328080 memory_mb=256 window_slices=4 queue_slices=6 max_live_slices=10
+BENCHMARK_RESULT cache=hot_prefetched mode=sequential axis=x total_sec=0.401 read_sec=0.295 write_sec=0.335 avg_ms=40.129 slices_per_sec=24.920 count=10 bytes=264328080 reader_pool_workers=16 reader_pool_jobs=3 reader_pool_serial_fallbacks=0 output_sync=requested plan_hash=1665cbc72a2c1b90
+         Y         0.437s     43.74ms        22.9 slices/s  (read_sec=0.314s, write_sec=0.161s, read 10, written 10, 0.22 GB written)
+         per-slice bytes: 24032008 x10 (uniform), total=240320080
+TIMING_MODEL value=overlapped_pipeline
+PIPELINE_RESULT producer_wall_sec=0.314 writer_service_sec=0.161 drain_sec=0.123 producer_wait_sec=0.000 queue_peak_slices=7 queue_peak_bytes=168224056 payload_peak_bound_bytes=264352088 memory_mb=256 window_slices=4 queue_slices=7 max_live_slices=11
+BENCHMARK_RESULT cache=hot_prefetched mode=sequential axis=y total_sec=0.437 read_sec=0.314 write_sec=0.161 avg_ms=43.743 slices_per_sec=22.861 count=10 bytes=240320080 reader_pool_workers=16 reader_pool_jobs=3 reader_pool_serial_fallbacks=0 output_sync=requested plan_hash=cd37d91f37db20eb
+         Z         0.396s     39.61ms        25.2 slices/s  (read_sec=0.330s, write_sec=0.120s, read 10, written 10, 0.16 GB written)
+         per-slice bytes: 17633616 x10 (uniform), total=176336160
+TIMING_MODEL value=overlapped_pipeline
+PIPELINE_RESULT producer_wall_sec=0.330 writer_service_sec=0.120 drain_sec=0.066 producer_wait_sec=0.000 queue_peak_slices=5 queue_peak_bytes=88168080 payload_peak_bound_bytes=264504240 memory_mb=256 window_slices=4 queue_slices=11 max_live_slices=15
+BENCHMARK_RESULT cache=hot_prefetched mode=sequential axis=z total_sec=0.396 read_sec=0.330 write_sec=0.120 avg_ms=39.614 slices_per_sec=25.243 count=10 bytes=176336160 reader_pool_workers=16 reader_pool_jobs=3 reader_pool_serial_fallbacks=0 output_sync=requested plan_hash=94a80cbf971ae4d6
+         ------------------------------------------
+         Avg          41.16ms  balance=1.10x  (over 3 axes)
+BENCHMARK_COMPARE mode=random axis=x observed_ratio=1.26
+BENCHMARK_COMPARE mode=random axis=y observed_ratio=0.94
+BENCHMARK_COMPARE mode=random axis=z observed_ratio=0.89
+BENCHMARK_COMPARE mode=sequential axis=x observed_ratio=0.76
+BENCHMARK_COMPARE mode=sequential axis=y observed_ratio=0.99
+BENCHMARK_COMPARE mode=sequential axis=z observed_ratio=1.19
+OUTPUT_VERIFY_RESULT ok=1 files_checked=330 bytes_checked=7490827520
+
+======================================================================
+  SUMMARY -- test50
+======================================================================
+  Storage:   51.41 GB / 49.28 GB = 1.043x
+  Outputs:   Z:\wutan\block3d-data\phase5_outputs\test50_20260717_122133\round_robin\round_1\20260717_122135_144_pid32116
+======================================================================
+
+Total elapsed: 299.9s

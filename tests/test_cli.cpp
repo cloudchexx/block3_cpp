@@ -175,6 +175,7 @@ int main(int argc, char* argv[]) {
     fs::create_directories(tmp, ec);
     fs::path raw = tmp / "in.dat";
     fs::path b3d = tmp / "out.b3d";
+    fs::path b3d_micro = tmp / "out_micro.b3d";
     fs::path scrub = tmp / "cache scrub.bin";
 
     constexpr uint64_t dx = 16, dy = 20, dz = 24;
@@ -232,6 +233,35 @@ int main(int argc, char* argv[]) {
     expect_ok("convert <raw> <b3d>",
               q(cli) + " convert " + q(raw) + " " + q(b3d) +
               " --dim-x 16 --dim-y 20 --dim-z 24 --block-size 16 --threads 2 --no-progress");
+
+    expect_output_contains("info legacy layout",
+        q(cli) + " info " + q(b3d),
+        "Layout:        legacy");
+
+    expect_ok("convert micro-tiled v2",
+              q(cli) + " convert " + q(raw) + " " + q(b3d_micro) +
+              " --dim-x 16 --dim-y 20 --dim-z 24 --block-size 16 --threads 2"
+              " --layout micro-tiled --micro-size 8 --no-progress");
+    expect_ok("verify micro-tiled v2",
+              q(cli) + " verify " + q(b3d_micro) + " " + q(raw) + " --samples 500");
+    expect_output_contains("info micro layout",
+        q(cli) + " info " + q(b3d_micro),
+        "Layout:        micro-tiled");
+    expect_output_contains("info micro version",
+        q(cli) + " info " + q(b3d_micro),
+        "Version:       2");
+    expect_output_contains("info micro size",
+        q(cli) + " info " + q(b3d_micro),
+        "Micro size:    8");
+    expect_clean_fail("convert bad micro size 0",
+        q(cli) + " convert " + q(raw) + " " + q(tmp / "bad0.b3d") +
+        " --dim-x 16 --dim-y 20 --dim-z 24 --block-size 16 --layout micro-tiled --micro-size 0 --no-progress");
+    expect_clean_fail("convert bad micro size 7",
+        q(cli) + " convert " + q(raw) + " " + q(tmp / "bad7.b3d") +
+        " --dim-x 16 --dim-y 20 --dim-z 24 --block-size 16 --layout micro-tiled --micro-size 7 --no-progress");
+    expect_clean_fail("convert non-divisible micro block",
+        q(cli) + " convert " + q(raw) + " " + q(tmp / "bad_bs.b3d") +
+        " --dim-x 16 --dim-y 20 --dim-z 24 --block-size 20 --layout micro-tiled --micro-size 8 --no-progress");
 
     // 2. verify with the canonical order <b3d> <raw> (b3d first).
     //    Regression for the arg-order bug: this is the natural invocation that

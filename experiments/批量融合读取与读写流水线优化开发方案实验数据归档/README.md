@@ -49,7 +49,7 @@ Correctness gates recorded in the source run:
 ## Directory layout
 
 ```text
-experiments/phase5_20260717/
+experiments/批量融合读取与读写流水线优化开发方案实验数据归档/
   README.md
   logs/
     test18_previous/              # 2026-07-16/early 2026-07-17 comparable baseline logs
@@ -118,15 +118,15 @@ Contiguous is substantially worse for test50 and must not be promoted to default
 From the project root:
 
 ```bash
-python experiments/phase5_20260717/derived/summarize_phase5_logs.py
+python experiments/批量融合读取与读写流水线优化开发方案实验数据归档/derived/summarize_phase5_logs.py
 python tools/compare_dispatch_ab.py \
-  --round-robin experiments/phase5_20260717/logs/test18_phase5_round_robin/*.log \
-  --contiguous experiments/phase5_20260717/logs/test18_phase5_contiguous/*.log \
-  > experiments/phase5_20260717/derived/test18_dispatch_ab.txt
+  --round-robin experiments/批量融合读取与读写流水线优化开发方案实验数据归档/logs/test18_phase5_round_robin/*.log \
+  --contiguous experiments/批量融合读取与读写流水线优化开发方案实验数据归档/logs/test18_phase5_contiguous/*.log \
+  > experiments/批量融合读取与读写流水线优化开发方案实验数据归档/derived/test18_dispatch_ab.txt
 python tools/compare_dispatch_ab.py \
-  --round-robin experiments/phase5_20260717/logs/test50_phase5_round_robin/*.log \
-  --contiguous experiments/phase5_20260717/logs/test50_phase5_contiguous/*.log \
-  > experiments/phase5_20260717/derived/test50_dispatch_ab.txt
+  --round-robin experiments/批量融合读取与读写流水线优化开发方案实验数据归档/logs/test50_phase5_round_robin/*.log \
+  --contiguous experiments/批量融合读取与读写流水线优化开发方案实验数据归档/logs/test50_phase5_contiguous/*.log \
+  > experiments/批量融合读取与读写流水线优化开发方案实验数据归档/derived/test50_dispatch_ab.txt
 ```
 
 ## Report notes

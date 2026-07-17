@@ -141,6 +141,9 @@ public:
     uint64_t     thread_pool_jobs() const;
     uint64_t     thread_pool_serial_fallbacks() const;
     ReadDispatchStrategy read_dispatch_strategy() const { return dispatch_strategy_; }
+    uint32_t version() const { return version_; }
+    BlockInnerLayout inner_layout() const { return inner_layout_; }
+    uint32_t micro_size() const { return micro_size_; }
     const BlockLayout3D& layout() const { return layout_; }
 
 private:
@@ -148,6 +151,9 @@ private:
     uint64_t block_size_ = 0;
     uint64_t total_blocks_ = 0;
     uint64_t data_offset_ = 0;
+    uint32_t version_ = VERSION_LEGACY;
+    BlockInnerLayout inner_layout_ = BlockInnerLayout::LegacyXYZ;
+    uint32_t micro_size_ = 0;
     int num_threads_ = 1;
     uint64_t max_memory_mb_ = 0;
     ReadDispatchStrategy dispatch_strategy_ = ReadDispatchStrategy::RoundRobin;
@@ -189,6 +195,11 @@ private:
     void cache_prune();
 
     uint64_t block_offset_float(uint32_t bx, uint32_t by_, uint32_t bz) const;
+    uint64_t local_offset(uint32_t lx, uint32_t ly, uint32_t lz) const;
+    void copy_z_run(const float* data, uint64_t block_float_offset,
+                    uint32_t lx, uint32_t ly,
+                    uint32_t lz_start, uint32_t lz_end,
+                    float* dst) const;
     // Returns a *copy* of the sorted block list. Must NOT return a reference
     // into the cache: the cache_mutex_ is released before the caller uses the
     // result, so an internal reference could dangle after a rehash/prune or a

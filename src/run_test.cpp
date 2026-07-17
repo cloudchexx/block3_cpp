@@ -174,15 +174,13 @@ static bool is_valid_b3d(const std::string& path,
                           uint64_t dx, uint64_t dy, uint64_t dz,
                           uint64_t bs = 0) {
     if (!fs::exists(path)) return false;
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return false;
-    FileHeader hdr;
-    f.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
-    if (f.gcount() != sizeof(FileHeader)) return false;
-    return std::memcmp(hdr.magic, MAGIC, 4) == 0 &&
-           hdr.version == VERSION &&
-           hdr.dim_x == dx && hdr.dim_y == dy && hdr.dim_z == dz &&
-           (bs == 0 || hdr.block_size == bs);
+    try {
+        BlockedFileReader reader(path);
+        return reader.dim_x() == dx && reader.dim_y() == dy && reader.dim_z() == dz &&
+               (bs == 0 || reader.block_size() == bs);
+    } catch (...) {
+        return false;
+    }
 }
 
 static std::string size_str(uint64_t bytes) {
@@ -1054,7 +1052,8 @@ static int run_full_test(const std::string& ds_name,
                            const std::string& batch_read,
                            size_t batch_window_slices,
                            const PipelineConfig& pipeline_config,
-                           ReadDispatchStrategy dispatch_strategy) {
+                           ReadDispatchStrategy dispatch_strategy,
+                           bool explicit_b3d_input) {
     print_sep("Dataset: " + ds_name + "  (" +
               std::to_string(cfg.dim_x) + "x" +
               std::to_string(cfg.dim_y) + "x" +
@@ -1063,15 +1062,15 @@ static int run_full_test(const std::string& ds_name,
     std::string b3d_path = cfg.b3d;
     std::string raw_path = cfg.raw;
 
-    // raw existence is validated by the caller, but be defensive.
-    if (!fs::exists(raw_path)) {
+    // raw is only required when conversion or explicit verification needs it.
+    if (!explicit_b3d_input && !fs::exists(raw_path)) {
         std::cout << "[ERROR] raw file '" << raw_path << "' not found for "
                   << ds_name << "\n";
         return 1;
     }
 
-    // Auto-detect block_size when not explicitly set.
-    if (block_size == 0) {
+    // Auto-detect block_size when not explicitly set and conversion may be needed.
+    if (block_size == 0 && !explicit_b3d_input) {
         auto slash = b3d_path.find_last_of("/\\");
         std::string parent =
             (slash != std::string::npos) ? b3d_path.substr(0, slash) : ".";
@@ -1089,6 +1088,11 @@ static int run_full_test(const std::string& ds_name,
         std::cout << "[SKIP] " << ds_name << ": '" << b3d_path
                   << "' already exists (" << size_str(sz)
                   << "), valid format\n";
+    } else if (explicit_b3d_input) {
+        std::cout << "[ERROR] explicit --b3d-file is not a valid .b3d for "
+                  << ds_name << " or does not match requested dimensions/block size: "
+                  << b3d_path << "\n";
+        return 1;
     } else {
         std::cout << "[CONVERT] " << ds_name << ": " << raw_path
                   << " -> " << b3d_path << "\n";
@@ -1115,9 +1119,28 @@ static int run_full_test(const std::string& ds_name,
                   << std::setprecision(3) << ratio << "x\n";
     }
 
+    {
+        BlockedFileReader metadata_reader(b3d_path);
+        const char* layout_name = metadata_reader.inner_layout() == BlockInnerLayout::MicroTiledXYZ
+            ? "micro-tiled"
+            : "legacy";
+        std::cout << "B3D_FORMAT dataset=" << ds_name
+                  << " file=" << b3d_path
+                  << " version=" << metadata_reader.version()
+                  << " layout=" << layout_name
+                  << " micro_size=" << metadata_reader.micro_size()
+                  << " block_size=" << metadata_reader.block_size()
+                  << "\n";
+    }
+
     // 2. Verify (opt-in). Reads the raw input, so it pollutes the page cache
     //    for THIS process; subsequent benchmarks are NOT cold-cache results.
     if (verify_enabled) {
+        if (!fs::exists(raw_path)) {
+            std::cout << "[ERROR] --verify requires raw file '" << raw_path
+                      << "' for " << ds_name << "\n";
+            return 1;
+        }
         if (verify_samples <= 0) {
             std::cout << "[ERROR] --verify requested but verify-samples="
                       << verify_samples << " is not positive\n";
@@ -1273,15 +1296,20 @@ static int run_full_test(const std::string& ds_name,
         if (!verify_phase_outputs(cold_dir, hot_dir, ds_name, plans)) return 1;
     }
 
-    auto raw_sz = fs::file_size(raw_path);
     auto b3d_sz = fs::file_size(b3d_path);
-    double ratio = static_cast<double>(b3d_sz) / static_cast<double>(raw_sz);
     std::cout << "\n" << std::string(70, '=') << "\n"
               << "  SUMMARY -- " << ds_name << "\n"
-              << std::string(70, '=') << "\n"
-              << "  Storage:   " << size_str(b3d_sz) << " / " << size_str(raw_sz)
-              << " = " << std::fixed << std::setprecision(3) << ratio << "x\n"
-              << "  Outputs:   " << run_dir.string() << "\n"
+              << std::string(70, '=') << "\n";
+    if (fs::exists(raw_path)) {
+        auto raw_sz = fs::file_size(raw_path);
+        double ratio = static_cast<double>(b3d_sz) / static_cast<double>(raw_sz);
+        std::cout << "  Storage:   " << size_str(b3d_sz) << " / " << size_str(raw_sz)
+                  << " = " << std::fixed << std::setprecision(3) << ratio << "x\n";
+    } else {
+        std::cout << "  Storage:   " << size_str(b3d_sz)
+                  << " (.b3d only; raw file not present)\n";
+    }
+    std::cout << "  Outputs:   " << run_dir.string() << "\n"
               << std::string(70, '=') << "\n\n";
     return 0;
 }
@@ -1303,6 +1331,7 @@ static void print_usage(const char* exe) {
               << "  --warm-up (compatibility alias for --cache-mode hot)\n"
               << "  --warmup-stride N --warmup-memory MB\n"
               << "  --output-dir DIR --no-output-sync --no-log\n"
+              << "  --b3d-file FILE (explicit .b3d path; requires a single dataset)\n"
               << "  --verify --verify-samples N --dim-x N --dim-y N --dim-z N\n";
 }
 
@@ -1331,6 +1360,7 @@ int main(int argc, char* argv[]) {
     int pipeline_memory_mb = 256;
     int pipeline_window_arg = 0;
     std::string read_dispatch = "round-robin";
+    std::string explicit_b3d_file;
     uint64_t custom_dx = 0, custom_dy = 0, custom_dz = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -1376,6 +1406,8 @@ int main(int argc, char* argv[]) {
             pipeline_window_arg = std::atoi(argv[++i]);
         } else if (arg == "--read-dispatch" && i + 1 < argc) {
             read_dispatch = argv[++i];
+        } else if (arg == "--b3d-file" && i + 1 < argc) {
+            explicit_b3d_file = argv[++i];
         } else if (arg == "--no-log") {
             no_log = true;
         } else if (arg == "--help" || arg == "-h") {
@@ -1430,6 +1462,10 @@ int main(int argc, char* argv[]) {
     }
 
     if (datasets.empty()) datasets = {"test18", "test50"};
+    if (!explicit_b3d_file.empty() && datasets.size() != 1) {
+        std::cerr << "[ERROR] --b3d-file requires exactly one dataset in --datasets\n";
+        return 2;
+    }
     if (warm_up) {
         if (cache_mode_explicit && cache_options.mode != CacheMode::Hot) {
             std::cerr << "[ERROR] --warm-up is a compatibility alias for --cache-mode hot and conflicts with cold/both\n";
@@ -1539,6 +1575,11 @@ int main(int argc, char* argv[]) {
         cfg.raw = resolve_path(cfg.raw, cwd, exe_dir);
         cfg.b3d = resolve_path(cfg.b3d, cwd, exe_dir);
     };
+    auto resolve_b3d_arg = [&]() -> std::string {
+        fs::path p(explicit_b3d_file);
+        if (p.is_absolute()) return p.string();
+        return resolve_path(explicit_b3d_file, cwd, exe_dir);
+    };
 
     // ── Unique run id (ms timestamp + pid) and unique shared run dir ──
     // Bump suffix until BOTH the output dir and (if logging) the log file
@@ -1641,8 +1682,25 @@ int main(int argc, char* argv[]) {
             cfg.dim_z = custom_dz;
         }
         resolve(cfg);
-
-        if (!fs::exists(cfg.raw)) {
+        if (!explicit_b3d_file.empty()) {
+            cfg.b3d = resolve_b3d_arg();
+            if (!fs::exists(cfg.b3d)) {
+                std::cout << "[ERROR] explicit .b3d file not found: " << cfg.b3d << "\n";
+                ret = 1;
+                break;
+            }
+            try {
+                BlockedFileReader reader(cfg.b3d);
+                cfg.dim_x = reader.dim_x();
+                cfg.dim_y = reader.dim_y();
+                cfg.dim_z = reader.dim_z();
+            } catch (const std::exception& e) {
+                std::cout << "[ERROR] cannot read explicit .b3d file '" << cfg.b3d
+                          << "': " << e.what() << "\n";
+                ret = 1;
+                break;
+            }
+        } else if (!fs::exists(cfg.raw)) {
             std::cout << "[ERROR] raw file not found for dataset '" << ds_name
                       << "': " << cfg.raw << "\n";
             ret = 1;
@@ -1664,7 +1722,8 @@ int main(int argc, char* argv[]) {
                             batch_read,
                             static_cast<size_t>(batch_window_arg),
                             pipeline_config,
-                            dispatch_strategy);
+                            dispatch_strategy,
+                            !explicit_b3d_file.empty());
         if (ret != 0) break;
     }
 

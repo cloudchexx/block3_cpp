@@ -8,6 +8,7 @@
 #include <thread>
 #include <atomic>
 #include <future>
+#include <stdexcept>
 
 #ifdef OMP_ENABLED
 #include <omp.h>
@@ -20,10 +21,34 @@ struct BlockData {
     std::vector<float> data;
 };
 
+static void validate_convert_options(uint64_t block_size,
+                                     BlockInnerLayout inner_layout,
+                                     uint32_t micro_size) {
+    if (inner_layout == BlockInnerLayout::LegacyXYZ) {
+        if (micro_size != 0) {
+            throw std::invalid_argument("legacy layout requires micro_size=0");
+        }
+        return;
+    }
+
+    if (inner_layout != BlockInnerLayout::MicroTiledXYZ) {
+        throw std::invalid_argument("unknown block inner layout");
+    }
+    if (micro_size != DEFAULT_MICRO_SIZE) {
+        throw std::invalid_argument("micro-tiled layout requires micro_size=8");
+    }
+    if (block_size % micro_size != 0) {
+        throw std::invalid_argument("block_size must be divisible by micro_size");
+    }
+}
+
 static void extract_block(uint32_t bx, uint32_t by_, uint32_t bz,
                           const float* raw_3d,
                           uint64_t dim_x, uint64_t dim_y, uint64_t dim_z,
-                          uint64_t bs, float* out) {
+                          uint64_t bs,
+                          BlockInnerLayout inner_layout,
+                          uint32_t micro_size,
+                          float* out) {
     uint64_t x0 = static_cast<uint64_t>(bx) * bs;
     uint64_t y0 = static_cast<uint64_t>(by_) * bs;
     uint64_t z0 = static_cast<uint64_t>(bz) * bs;
@@ -31,23 +56,43 @@ static void extract_block(uint32_t bx, uint32_t by_, uint32_t bz,
     uint64_t ny = std::min(bs, dim_y - y0);
     uint64_t nz = std::min(bs, dim_z - z0);
 
-    if (nx == bs && ny == bs && nz == bs) {
-        for (uint64_t lx = 0; lx < bs; lx++) {
-            uint64_t raw_base = (x0 + lx) * dim_y * dim_z + y0 * dim_z + z0;
-            for (uint64_t ly = 0; ly < bs; ly++) {
-                std::memcpy(&out[lx * bs * bs + ly * bs],
-                            &raw_3d[raw_base + ly * dim_z],
-                            bs * sizeof(float));
+    if (inner_layout == BlockInnerLayout::LegacyXYZ) {
+        if (nx == bs && ny == bs && nz == bs) {
+            for (uint64_t lx = 0; lx < bs; lx++) {
+                uint64_t raw_base = (x0 + lx) * dim_y * dim_z + y0 * dim_z + z0;
+                for (uint64_t ly = 0; ly < bs; ly++) {
+                    std::memcpy(&out[legacy_local_offset(bs,
+                                                         static_cast<uint32_t>(lx),
+                                                         static_cast<uint32_t>(ly),
+                                                         0)],
+                                &raw_3d[raw_base + ly * dim_z],
+                                bs * sizeof(float));
+                }
+            }
+        } else {
+            std::memset(out, 0, bs * bs * bs * sizeof(float));
+            for (uint64_t lx = 0; lx < nx; lx++) {
+                uint64_t raw_base = (x0 + lx) * dim_y * dim_z + y0 * dim_z + z0;
+                for (uint64_t ly = 0; ly < ny; ly++) {
+                    std::memcpy(&out[legacy_local_offset(bs,
+                                                         static_cast<uint32_t>(lx),
+                                                         static_cast<uint32_t>(ly),
+                                                         0)],
+                                &raw_3d[raw_base + ly * dim_z],
+                                nz * sizeof(float));
+                }
             }
         }
-    } else {
-        std::memset(out, 0, bs * bs * bs * sizeof(float));
-        for (uint64_t lx = 0; lx < nx; lx++) {
-            uint64_t raw_base = (x0 + lx) * dim_y * dim_z + y0 * dim_z + z0;
-            for (uint64_t ly = 0; ly < ny; ly++) {
-                std::memcpy(&out[lx * bs * bs + ly * bs],
-                            &raw_3d[raw_base + ly * dim_z],
-                            nz * sizeof(float));
+        return;
+    }
+
+    std::memset(out, 0, bs * bs * bs * sizeof(float));
+    for (uint32_t lx = 0; lx < nx; lx++) {
+        uint64_t raw_base = (x0 + lx) * dim_y * dim_z + y0 * dim_z + z0;
+        for (uint32_t ly = 0; ly < ny; ly++) {
+            for (uint32_t lz = 0; lz < nz; lz++) {
+                uint64_t dst = micro_tiled_local_offset(bs, micro_size, lx, ly, lz);
+                out[dst] = raw_3d[raw_base + static_cast<uint64_t>(ly) * dim_z + lz];
             }
         }
     }
@@ -57,11 +102,16 @@ void convert_raw_to_blocked(
     const std::string& raw_path,
     const std::string& output_path,
     uint64_t dim_x, uint64_t dim_y, uint64_t dim_z,
-    uint64_t block_size,
-    int num_threads,
-    bool progress,
-    uint64_t max_memory_mb)
+    const ConvertOptions& options)
 {
+    uint64_t block_size = options.block_size;
+    int num_threads = options.num_threads;
+    bool progress = options.progress;
+    uint64_t max_memory_mb = options.max_memory_mb;
+    BlockInnerLayout inner_layout = options.inner_layout;
+    uint32_t micro_size = options.micro_size;
+    validate_convert_options(block_size, inner_layout, micro_size);
+
     if (num_threads <= 0)
         num_threads = static_cast<int>(std::thread::hardware_concurrency());
     if (num_threads < 1) num_threads = 1;
@@ -80,14 +130,19 @@ void convert_raw_to_blocked(
 
     FileHeader header;
     std::memcpy(header.magic, MAGIC, 4);
-    header.version      = VERSION;
+    header.version      = inner_layout == BlockInnerLayout::MicroTiledXYZ
+                         ? VERSION_MICROTILE
+                         : VERSION_LEGACY;
     header.dim_x        = dim_x;
     header.dim_y        = dim_y;
     header.dim_z        = dim_z;
     header.block_size   = block_size;
     header.total_blocks = layout.total_blocks;
     header.data_offset  = aligned_data_offset(layout.total_blocks);
-    header.reserved     = 0;
+    header.reserved     = inner_layout == BlockInnerLayout::MicroTiledXYZ
+                         ? encode_layout(static_cast<uint8_t>(LAYOUT_MICRO_TILED_XYZ),
+                                         static_cast<uint8_t>(micro_size))
+                         : 0;
 
     out.write(reinterpret_cast<const char*>(&header), sizeof(header));
 
@@ -159,7 +214,8 @@ void convert_raw_to_blocked(
             meta[i].linear_idx = layout.linear_index(bx, by_, bz);
             float* dst = pool.data() + i * layout.block_floats;
             extract_block(bx, by_, bz, raw_3d,
-                          dim_x, dim_y, dim_z, bs, dst);
+                          dim_x, dim_y, dim_z, bs,
+                          inner_layout, micro_size, dst);
         }
     };
 
@@ -226,6 +282,23 @@ void convert_raw_to_blocked(
     if (progress) {
         std::cout << "Conversion complete: " << output_path << std::endl;
     }
+}
+
+void convert_raw_to_blocked(
+    const std::string& raw_path,
+    const std::string& output_path,
+    uint64_t dim_x, uint64_t dim_y, uint64_t dim_z,
+    uint64_t block_size,
+    int num_threads,
+    bool progress,
+    uint64_t max_memory_mb)
+{
+    ConvertOptions options;
+    options.block_size = block_size;
+    options.num_threads = num_threads;
+    options.progress = progress;
+    options.max_memory_mb = max_memory_mb;
+    convert_raw_to_blocked(raw_path, output_path, dim_x, dim_y, dim_z, options);
 }
 
 } // namespace block3d

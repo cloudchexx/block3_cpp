@@ -1,0 +1,5 @@
+dataset,layout,group,runs,total_elapsed_median_sec,workload_total_median_sec,workload_total_mean_sec
+test18,legacy,test18_legacy,3,125.7,24.94,25.386
+test18,micro8,test18_micro8,3,123.3,21.397,23.355
+test50,legacy,test50_legacy,3,316.4,147.85,145.29
+test50,micro8,test50_micro8,2,247.10000000000002,97.083,97.083

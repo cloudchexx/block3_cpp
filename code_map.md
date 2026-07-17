@@ -21,8 +21,9 @@
 纯 float32 原始 .dat（无头，X-Y-Z；Z 连续）
   -> convert_raw_to_blocked()
   -> 64-byte header + logical offset table + aligned Morton-ordered blocks
+     (v1 legacy XYZ or v2 8³ micro-tiled block interior)
   -> .b3d
-  -> BlockedFileReader + mmap
+  -> BlockedFileReader + mmap + header-driven block-local addressing
   -> slices / columns / subvolume / point / full volume / verify
 ```
 
@@ -38,9 +39,10 @@ fixed-size blocks                     # Morton/Z-order 物理顺序
 ```
 
 - 索引值：块的绝对文件字节偏移。
-- 块内布局：局部 X-Y-Z，Z 连续。
+- v1 块内布局：局部 X-Y-Z，Z 连续。
+- v2 块内布局：`reserved` 低 8 bit 标记 `micro-tiled`，次低 8 bit 记录 `micro_size=8`；宏块内部按固定 8³ micro tile 排列，micro 内 Z 连续。
 - 边界块：固定大小并补零。
-- 当前格式：magic `3DBK`，version `1`。
+- 当前默认转换格式：magic `3DBK`，version `1`；显式 `--layout micro-tiled --micro-size 8` 生成 version `2`。
 
 ## 构建目标
 
@@ -66,6 +68,7 @@ fixed-size blocks                     # Morton/Z-order 物理顺序
 | 目录 | 内容 |
 |---|---|
 | `experiments/批量融合读取与读写流水线优化开发方案实验数据归档/` | 批量融合读取与读写流水线优化开发方案实验数据归档正式验收归档：选定 benchmark 日志、派生 CSV、dispatch A/B 文本输出和报告说明。 |
+| `experiments/phase6_20260717/` | 块内微分块 v2 / micro8 A/B 归档：原实现方案、test18/test50 legacy vs micro8 run_test 日志副本、派生 CSV 和结论说明。 |
 
 该归档只保存文本日志和汇总结果，不保存 `benchmark_output` / `phase5_outputs` 下的大型 `.raw` 切片输出。
 
@@ -84,7 +87,7 @@ ctest --test-dir build -C Release --output-on-failure
 - reader 的共享块列表缓存必须在线程锁外使用副本。
 - 性能结果必须结合 OS 页缓存状态解释。
 - Morton 位扩展使用 64-bit code，每轴保留低 21 位。
-- `convert` 默认自适应块大小（存储探测 + `auto_block_size()`）；`--block-size 0` 或不传即为自动，显式 N 可覆盖。
+- `convert` 默认自适应块大小（存储探测 + `auto_block_size()`）并生成 v1 legacy；`--block-size 0` 或不传即为自动，显式 N 可覆盖；`--layout micro-tiled --micro-size 8` 生成 v2 micro8。
 - `read_x/y/z_slice` 和 fused `read_slices_batch(_stream)` 复用 reader 生命周期持久线程池；块分发可用 `round-robin` 或 `contiguous` physical chunks 做 A/B。
 - `block3d_cli cache-prepare` 创建可复用 scrub 文件；`bench --cold-method scrub` 逐页读取该文件作为本地 `cold_scrubbed` 口径。
 - `--warm-up` 标志（`cli bench` 和 `run_test`）在计时前将数据区预加载到 OS 页缓存；`cli bench` 中它是 `--cache-mode hot` 的兼容别名。

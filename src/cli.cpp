@@ -20,7 +20,7 @@ static void print_usage(const char* prog) {
     std::cerr << "Usage:\n";
     std::cerr << "  " << prog << " convert <input> <output> --dim-x N --dim-y N --dim-z N\n";
     std::cerr << "         [--block-size N]  (16–256; 0 or omit = auto-detect via storage probe)\n";
-    std::cerr << "         [--threads N] [--memory-limit N] [--no-progress]\n";
+    std::cerr << "         [--threads N] [--memory-limit N] [--layout legacy|micro-tiled] [--micro-size N] [--no-progress]\n";
     std::cerr << "  " << prog << " info <file>\n";
     std::cerr << "  " << prog << " cache-prepare <file> --size auto|N[GB] [--cold-scrub-ratio R] [--overwrite]\n";
     std::cerr << "  " << prog << " bench <file> [--num-reads N] [--random] [--threads N] [--memory-limit N]\n";
@@ -103,6 +103,27 @@ static int cmd_convert(int argc, char* argv[]) {
     int nt = get_arg_int(argc, argv, "--threads", 0);
     uint64_t mem_mb = get_arg_uint64(argc, argv, "--memory-limit", 0);
     bool prog = !has_arg(argc, argv, "--no-progress");
+    std::string layout_name = get_arg(argc, argv, "--layout", "legacy");
+    BlockInnerLayout inner_layout = BlockInnerLayout::LegacyXYZ;
+    uint32_t micro_size = 0;
+    if (layout_name == "legacy") {
+        inner_layout = BlockInnerLayout::LegacyXYZ;
+        micro_size = static_cast<uint32_t>(get_arg_uint64(argc, argv, "--micro-size", 0));
+        if (micro_size != 0) {
+            std::cerr << "--layout legacy requires --micro-size 0 or omitted\n";
+            return 1;
+        }
+    } else if (layout_name == "micro-tiled") {
+        inner_layout = BlockInnerLayout::MicroTiledXYZ;
+        micro_size = static_cast<uint32_t>(get_arg_uint64(argc, argv, "--micro-size", DEFAULT_MICRO_SIZE));
+        if (micro_size != DEFAULT_MICRO_SIZE) {
+            std::cerr << "--layout micro-tiled requires --micro-size 8\n";
+            return 1;
+        }
+    } else {
+        std::cerr << "Invalid layout: " << layout_name << " (must be legacy or micro-tiled)\n";
+        return 1;
+    }
 
     // Auto-detect storage medium and pick optimal block_size.
     if (bs == 0) {
@@ -122,16 +143,32 @@ static int cmd_convert(int argc, char* argv[]) {
                   << " (must be 16–256, or 0 for auto)\n";
         return 1;
     }
+    if (inner_layout == BlockInnerLayout::MicroTiledXYZ && bs % micro_size != 0) {
+        std::cerr << "block_size must be divisible by micro_size\n";
+        return 1;
+    }
 
     std::cout << "Converting: " << input << " -> " << output << "\n";
     std::cout << "  dims=" << dx << "x" << dy << "x" << dz
               << " block_size=" << bs << " threads="
-              << (nt ? std::to_string(nt) : "auto");
+              << (nt ? std::to_string(nt) : "auto")
+              << " layout=" << layout_name;
+    if (inner_layout == BlockInnerLayout::MicroTiledXYZ) {
+        std::cout << " micro_size=" << micro_size;
+    }
     if (mem_mb) std::cout << " mem_limit=" << mem_mb << "MB";
     std::cout << "\n";
 
+    ConvertOptions options;
+    options.block_size = bs;
+    options.num_threads = nt;
+    options.progress = prog;
+    options.max_memory_mb = mem_mb;
+    options.inner_layout = inner_layout;
+    options.micro_size = micro_size;
+
     auto t0 = std::chrono::high_resolution_clock::now();
-    convert_raw_to_blocked(input, output, dx, dy, dz, bs, nt, prog, mem_mb);
+    convert_raw_to_blocked(input, output, dx, dy, dz, options);
     auto t1 = std::chrono::high_resolution_clock::now();
     double dt = std::chrono::duration<double>(t1 - t0).count();
 
@@ -158,7 +195,12 @@ static int cmd_info(int argc, char* argv[]) {
     std::cout << "Dimensions:    X=" << reader.dim_x()
               << " Y=" << reader.dim_y()
               << " Z=" << reader.dim_z() << "\n";
+    std::cout << "Version:       " << reader.version() << "\n";
     std::cout << "Block size:    " << reader.block_size() << "\n";
+    std::cout << "Layout:        "
+              << (reader.inner_layout() == BlockInnerLayout::MicroTiledXYZ
+                  ? "micro-tiled" : "legacy") << "\n";
+    std::cout << "Micro size:    " << reader.micro_size() << "\n";
     std::cout << "Total blocks:  " << reader.total_blocks() << "\n";
     std::cout << "Data offset:   " << reader.data_offset() << "\n";
     std::cout << "Blocks layout: " << lay.blocks_x << "x" << lay.blocks_y

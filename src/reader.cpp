@@ -389,6 +389,31 @@ BlockedFileReader::BlockedFileReader(const std::string& file_path,
     if (std::memcmp(hdr.magic, MAGIC, 4) != 0)
         throw std::runtime_error("Invalid file magic");
 
+    if (hdr.version == VERSION_LEGACY) {
+        if (hdr.reserved != 0) {
+            throw std::runtime_error("Unsupported v1 layout metadata");
+        }
+        inner_layout_ = BlockInnerLayout::LegacyXYZ;
+        micro_size_ = 0;
+    } else if (hdr.version == VERSION_MICROTILE) {
+        uint8_t layout_kind = header_layout_kind(hdr.reserved);
+        uint8_t micro_size = header_micro_size(hdr.reserved);
+        uint64_t reserved_high = hdr.reserved & ~0xffffULL;
+        if (layout_kind != LAYOUT_MICRO_TILED_XYZ ||
+            micro_size != DEFAULT_MICRO_SIZE ||
+            reserved_high != 0) {
+            throw std::runtime_error("Unsupported v2 layout metadata");
+        }
+        if (hdr.block_size % micro_size != 0) {
+            throw std::runtime_error("Invalid micro-tiled block_size/micro_size");
+        }
+        inner_layout_ = BlockInnerLayout::MicroTiledXYZ;
+        micro_size_ = micro_size;
+    } else {
+        throw std::runtime_error("Unsupported file version");
+    }
+
+    version_ = hdr.version;
     dim_x_ = hdr.dim_x;
     dim_y_ = hdr.dim_y;
     dim_z_ = hdr.dim_z;
@@ -468,6 +493,33 @@ BlockedFileReader::block_offset_float(uint32_t bx, uint32_t by_,
         throw std::out_of_range("block_offset_float: linear index out of range");
     }
     return block_offsets_[lin] / 4;
+}
+
+uint64_t BlockedFileReader::local_offset(uint32_t lx, uint32_t ly, uint32_t lz) const {
+    return local_offset_for_layout(inner_layout_, block_size_, micro_size_, lx, ly, lz);
+}
+
+void BlockedFileReader::copy_z_run(const float* data,
+                                   uint64_t block_float_offset,
+                                   uint32_t lx, uint32_t ly,
+                                   uint32_t lz_start, uint32_t lz_end,
+                                   float* dst) const {
+    if (lz_start >= lz_end) return;
+    if (inner_layout_ == BlockInnerLayout::LegacyXYZ) {
+        const float* src = data + block_float_offset
+            + legacy_local_offset(block_size_, lx, ly, lz_start);
+        std::memcpy(dst, src, static_cast<size_t>(lz_end - lz_start) * sizeof(float));
+        return;
+    }
+
+    const uint32_t m = micro_size_;
+    uint32_t lz = lz_start;
+    while (lz < lz_end) {
+        uint32_t next = std::min<uint32_t>(lz_end, ((lz / m) + 1) * m);
+        const float* src = data + block_float_offset + local_offset(lx, ly, lz);
+        std::memcpy(dst + (lz - lz_start), src, static_cast<size_t>(next - lz) * sizeof(float));
+        lz = next;
+    }
 }
 
 void BlockedFileReader::cache_prune() {
@@ -575,14 +627,10 @@ std::vector<float> BlockedFileReader::read_x_slice(uint64_t x) {
             uint64_t nz_part = std::min(bs, dim_z_ - z0);
 
             uint64_t boff = block_offset_float(c.bx, c.by_, c.bz);
-            const float* src = dv + boff + static_cast<uint64_t>(lx) * bs * bs;
 
-            for (uint64_t ly = 0; ly < ny_part; ly++) {
+            for (uint32_t ly = 0; ly < ny_part; ly++) {
                 float* dst = &result[(y0 + ly) * nz + z0];
-                const float* srow = src + ly * bs;
-                for (uint64_t lz = 0; lz < nz_part; lz++) {
-                    dst[lz] = srow[lz];
-                }
+                copy_z_run(dv, boff, lx, ly, 0, static_cast<uint32_t>(nz_part), dst);
             }
         });
 
@@ -617,13 +665,8 @@ std::vector<float> BlockedFileReader::read_y_slice(uint64_t y) {
             uint64_t boff = block_offset_float(c.bx, c.by_, c.bz);
 
             for (uint32_t lx = 0; lx < nx_part; lx++) {
-                const float* src = dv + boff
-                    + static_cast<uint64_t>(lx) * bs * bs
-                    + static_cast<uint64_t>(ly) * bs;
                 float* dst = &result[(x0 + lx) * nz + z0];
-                for (uint64_t lz = 0; lz < nz_part; lz++) {
-                    dst[lz] = src[lz];
-                }
+                copy_z_run(dv, boff, lx, ly, 0, static_cast<uint32_t>(nz_part), dst);
             }
         });
 
@@ -644,8 +687,6 @@ std::vector<float> BlockedFileReader::read_z_slice(uint64_t z) {
     uint32_t bz = static_cast<uint32_t>(z / bs);
     uint32_t lz = static_cast<uint32_t>(z % bs);
 
-    uint64_t bs2 = bs * bs;
-
     auto blocks = sorted_block_list('z', z);
 
     for_each_block_parallel(blocks,
@@ -660,11 +701,10 @@ std::vector<float> BlockedFileReader::read_z_slice(uint64_t z) {
             uint64_t boff = block_offset_float(c.bx, c.by_, c.bz);
 
             for (uint32_t lx = 0; lx < nx_part; lx++) {
-                const float* src_plane = dv + boff + static_cast<uint64_t>(lx) * bs2;
                 uint64_t x_row = (x0 + lx) * ny;
                 for (uint32_t ly = 0; ly < ny_part; ly++) {
                     result[x_row + (y0 + ly)] =
-                        src_plane[static_cast<uint64_t>(ly) * bs + lz];
+                        dv[boff + local_offset(lx, ly, lz)];
                 }
             }
         });
@@ -771,15 +811,11 @@ void BlockedFileReader::read_slices_batch_stream(
                         uint64_t boff = block_offset_float(c.bx, c.by_, c.bz);
                         for (size_t wi = 0; wi < window.size(); wi++) {
                             const SliceRequest& req = group[start + wi];
-                            const float* src = dv + boff
-                                + static_cast<uint64_t>(req.local) * bs * bs;
                             auto& result = window[wi];
-                            for (uint64_t ly = 0; ly < ny_part; ly++) {
+                            for (uint32_t ly = 0; ly < ny_part; ly++) {
                                 float* dst = &result[(y0 + ly) * dim_z_ + z0];
-                                const float* srow = src + ly * bs;
-                                for (uint64_t lz = 0; lz < nz_part; lz++) {
-                                    dst[lz] = srow[lz];
-                                }
+                                copy_z_run(dv, boff, req.local, ly, 0,
+                                           static_cast<uint32_t>(nz_part), dst);
                             }
                         }
                     } else if (axis == 'y') {
@@ -792,13 +828,9 @@ void BlockedFileReader::read_slices_batch_stream(
                             const SliceRequest& req = group[start + wi];
                             auto& result = window[wi];
                             for (uint32_t lx = 0; lx < nx_part; lx++) {
-                                const float* src = dv + boff
-                                    + static_cast<uint64_t>(lx) * bs * bs
-                                    + static_cast<uint64_t>(req.local) * bs;
                                 float* dst = &result[(x0 + lx) * dim_z_ + z0];
-                                for (uint64_t lz = 0; lz < nz_part; lz++) {
-                                    dst[lz] = src[lz];
-                                }
+                                copy_z_run(dv, boff, lx, req.local, 0,
+                                           static_cast<uint32_t>(nz_part), dst);
                             }
                         }
                     } else {
@@ -807,18 +839,14 @@ void BlockedFileReader::read_slices_batch_stream(
                         uint64_t nx_part = std::min(bs, dim_x_ - x0);
                         uint64_t ny_part = std::min(bs, dim_y_ - y0);
                         uint64_t boff = block_offset_float(c.bx, c.by_, c.bz);
-                        uint64_t bs2 = bs * bs;
                         for (uint32_t lx = 0; lx < nx_part; lx++) {
-                            const float* src_plane = dv + boff
-                                + static_cast<uint64_t>(lx) * bs2;
                             uint64_t x_row = (x0 + lx) * dim_y_;
                             for (uint32_t ly = 0; ly < ny_part; ly++) {
-                                const float* src = src_plane
-                                    + static_cast<uint64_t>(ly) * bs;
                                 uint64_t dst_idx = x_row + (y0 + ly);
                                 for (size_t wi = 0; wi < window.size(); wi++) {
                                     const SliceRequest& req = group[start + wi];
-                                    window[wi][dst_idx] = src[req.local];
+                                    window[wi][dst_idx] =
+                                        dv[boff + local_offset(lx, ly, req.local)];
                                 }
                             }
                         }
@@ -870,10 +898,7 @@ std::vector<float> BlockedFileReader::read_x_column(uint64_t y, uint64_t z) {
         uint64_t boff = block_offset_float(bx, by_, bz);
 
         for (uint32_t lx = 0; lx < nx_part; lx++) {
-            result[x0 + lx] = dv[boff
-                + static_cast<uint64_t>(lx) * bs * bs
-                + static_cast<uint64_t>(ly) * bs
-                + lz];
+            result[x0 + lx] = dv[boff + local_offset(lx, ly, lz)];
         }
     }
     return result;
@@ -898,10 +923,7 @@ std::vector<float> BlockedFileReader::read_y_column(uint64_t x, uint64_t z) {
         uint64_t boff = block_offset_float(bx, by_, bz);
 
         for (uint32_t ly = 0; ly < ny_part; ly++) {
-            result[y0 + ly] = dv[boff
-                + static_cast<uint64_t>(lx) * bs * bs
-                + static_cast<uint64_t>(ly) * bs
-                + lz];
+            result[y0 + ly] = dv[boff + local_offset(lx, ly, lz)];
         }
     }
     return result;
@@ -925,10 +947,7 @@ std::vector<float> BlockedFileReader::read_z_column(uint64_t x, uint64_t y) {
         uint64_t nz_part = std::min(bs, dim_z_ - z0);
         uint64_t boff = block_offset_float(bx, by_, bz);
 
-        const float* src = dv + boff
-            + static_cast<uint64_t>(lx) * bs * bs
-            + static_cast<uint64_t>(ly) * bs;
-        std::memcpy(&result[z0], src, nz_part * sizeof(float));
+        copy_z_run(dv, boff, lx, ly, 0, static_cast<uint32_t>(nz_part), &result[z0]);
     }
     return result;
 }
@@ -1049,14 +1068,9 @@ BlockedFileReader::read_subvolume(uint64_t xs, uint64_t xe,
                     uint64_t dx = x0 + lx - xs;
                     for (uint32_t ly = ly_start; ly < ly_end; ly++) {
                         uint64_t dy = y0 + ly - ys;
-                        uint64_t src_start = boff
-                            + static_cast<uint64_t>(lx) * bs * bs
-                            + static_cast<uint64_t>(ly) * bs
-                            + lz_start;
                         uint64_t dst_idx = dx * ny * nz + dy * nz;
-                        std::memcpy(&result[dst_idx + (z0 + lz_start - zs)],
-                                    dv + src_start,
-                                    ln * sizeof(float));
+                        float* dst = &result[dst_idx + (z0 + lz_start - zs)];
+                        copy_z_run(dv, boff, lx, ly, lz_start, lz_end, dst);
                     }
                 }
             }
@@ -1080,10 +1094,7 @@ float BlockedFileReader::read_point(uint64_t x, uint64_t y, uint64_t z) {
     uint32_t ly = static_cast<uint32_t>(y % bs);
     uint32_t lz = static_cast<uint32_t>(z % bs);
     uint64_t boff = block_offset_float(bx, by_, bz);
-    return mapped_file_.data()[boff
-        + static_cast<uint64_t>(lx) * bs * bs
-        + static_cast<uint64_t>(ly) * bs
-        + lz];
+    return mapped_file_.data()[boff + local_offset(lx, ly, lz)];
 }
 
 bool BlockedFileReader::verify(const std::string& raw_path,

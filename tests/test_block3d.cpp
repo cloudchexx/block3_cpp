@@ -30,6 +30,42 @@ static bool allclose(const std::vector<float>& a,
     return true;
 }
 
+static int test_format_layout_helpers() {
+    std::cout << "  Format layout helpers...";
+
+    if (VERSION != VERSION_LEGACY || VERSION_LEGACY != 1 || VERSION_MICROTILE != 2) {
+        std::cerr << "FAIL version constants\n";
+        return 1;
+    }
+    uint64_t encoded = encode_layout(static_cast<uint8_t>(LAYOUT_MICRO_TILED_XYZ),
+                                     static_cast<uint8_t>(DEFAULT_MICRO_SIZE));
+    if (header_layout_kind(encoded) != LAYOUT_MICRO_TILED_XYZ ||
+        header_micro_size(encoded) != DEFAULT_MICRO_SIZE) {
+        std::cerr << "FAIL layout encode/decode\n";
+        return 1;
+    }
+    if (legacy_local_offset(16, 1, 2, 3) != 1 * 16 * 16 + 2 * 16 + 3) {
+        std::cerr << "FAIL legacy local offset\n";
+        return 1;
+    }
+    if (micro_tiled_local_offset(16, 8, 0, 8, 0) != 1024) {
+        std::cerr << "FAIL micro local offset\n";
+        return 1;
+    }
+    if (micro_tiled_local_offset(16, 8, 0, 0, 8) != 512) {
+        std::cerr << "FAIL micro z-tile offset\n";
+        return 1;
+    }
+    if (local_offset_for_layout(BlockInnerLayout::LegacyXYZ, 16, 0, 0, 8, 0) ==
+        local_offset_for_layout(BlockInnerLayout::MicroTiledXYZ, 16, 8, 0, 8, 0)) {
+        std::cerr << "FAIL layout offsets should differ\n";
+        return 1;
+    }
+
+    std::cout << "PASS\n";
+    return 0;
+}
+
 static int test_morton() {
     std::cout << "  Morton encode/decode roundtrip...";
     for (uint32_t bx = 0; bx < 64; bx++) {
@@ -926,6 +962,190 @@ static int test_batch_column_read() {
     return 0;
 }
 
+static int test_micro_tiled_roundtrip() {
+    std::cout << "  Micro-tiled v2 roundtrip...";
+
+    const uint64_t dx = 17, dy = 19, dz = 23;
+    const uint64_t bs = 16;
+    const uint64_t total = dx * dy * dz;
+    std::vector<float> raw_data(total);
+    for (uint64_t x = 0; x < dx; x++)
+        for (uint64_t y = 0; y < dy; y++)
+            for (uint64_t z = 0; z < dz; z++)
+                raw_data[x * dy * dz + y * dz + z] =
+                    static_cast<float>(x * 1000000 + y * 1000 + z);
+
+    auto at = [&](uint64_t x, uint64_t y, uint64_t z) -> float {
+        return raw_data[x * dy * dz + y * dz + z];
+    };
+
+    fs::path tmp = fs::temp_directory_path() / "block3d_test";
+    fs::path raw_path = tmp / "test_micro_raw.dat";
+    fs::path legacy_path = tmp / "test_micro_legacy.b3d";
+    fs::path micro_path = tmp / "test_micro_v2.b3d";
+
+    {
+        std::ofstream f(raw_path, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(raw_data.data()),
+                raw_data.size() * sizeof(float));
+    }
+
+    convert_raw_to_blocked(raw_path.string(), legacy_path.string(),
+                           dx, dy, dz, bs, 2, false);
+    {
+        std::ifstream f(legacy_path, std::ios::binary);
+        FileHeader hdr{};
+        f.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
+        if (hdr.version != VERSION_LEGACY || hdr.reserved != 0) {
+            std::cerr << "FAIL legacy header version/layout\n";
+            return 1;
+        }
+    }
+
+    ConvertOptions options;
+    options.block_size = bs;
+    options.num_threads = 2;
+    options.progress = false;
+    options.inner_layout = BlockInnerLayout::MicroTiledXYZ;
+    options.micro_size = DEFAULT_MICRO_SIZE;
+    convert_raw_to_blocked(raw_path.string(), micro_path.string(),
+                           dx, dy, dz, options);
+
+    {
+        std::ifstream f(micro_path, std::ios::binary);
+        FileHeader hdr{};
+        f.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
+        if (hdr.version != VERSION_MICROTILE ||
+            header_layout_kind(hdr.reserved) != LAYOUT_MICRO_TILED_XYZ ||
+            header_micro_size(hdr.reserved) != DEFAULT_MICRO_SIZE ||
+            (hdr.reserved & ~0xffffULL) != 0) {
+            std::cerr << "FAIL micro header version/layout\n";
+            return 1;
+        }
+    }
+
+    BlockedFileReader reader(micro_path.string(), 4);
+    if (reader.version() != VERSION_MICROTILE ||
+        reader.inner_layout() != BlockInnerLayout::MicroTiledXYZ ||
+        reader.micro_size() != DEFAULT_MICRO_SIZE) {
+        std::cerr << "FAIL reader layout metadata\n";
+        return 1;
+    }
+
+    for (auto [x, y, z] : std::vector<std::tuple<uint64_t, uint64_t, uint64_t>>{
+             {0, 0, 0}, {1, 2, 3}, {8, 9, 10}, {16, 18, 22}}) {
+        if (std::abs(reader.read_point(x, y, z) - at(x, y, z)) > 1e-6f) {
+            std::cerr << "FAIL micro point at (" << x << "," << y << "," << z << ")\n";
+            return 1;
+        }
+    }
+
+    for (uint64_t x : {0ULL, 8ULL, dx - 1}) {
+        auto slice = reader.read_x_slice(x);
+        if (slice.size() != dy * dz) { std::cerr << "FAIL micro x size\n"; return 1; }
+        for (uint64_t y = 0; y < dy; y++)
+            for (uint64_t z = 0; z < dz; z++)
+                if (std::abs(slice[y * dz + z] - at(x, y, z)) > 1e-6f) {
+                    std::cerr << "FAIL micro x slice\n"; return 1;
+                }
+    }
+    for (uint64_t y : {0ULL, 8ULL, dy - 1}) {
+        auto slice = reader.read_y_slice(y);
+        if (slice.size() != dx * dz) { std::cerr << "FAIL micro y size\n"; return 1; }
+        for (uint64_t x = 0; x < dx; x++)
+            for (uint64_t z = 0; z < dz; z++)
+                if (std::abs(slice[x * dz + z] - at(x, y, z)) > 1e-6f) {
+                    std::cerr << "FAIL micro y slice\n"; return 1;
+                }
+    }
+    for (uint64_t z : {0ULL, 8ULL, dz - 1}) {
+        auto slice = reader.read_z_slice(z);
+        if (slice.size() != dx * dy) { std::cerr << "FAIL micro z size\n"; return 1; }
+        for (uint64_t x = 0; x < dx; x++)
+            for (uint64_t y = 0; y < dy; y++)
+                if (std::abs(slice[x * dy + y] - at(x, y, z)) > 1e-6f) {
+                    std::cerr << "FAIL micro z slice\n"; return 1;
+                }
+    }
+
+    for (char axis : {'x', 'y', 'z'}) {
+        uint64_t dim = axis == 'x' ? dx : axis == 'y' ? dy : dz;
+        std::vector<uint64_t> indices = {0, 7, 8, dim - 1};
+        auto batch = reader.read_slices_batch(axis, indices, 4);
+        for (size_t i = 0; i < indices.size(); i++) {
+            auto single = reader.read_slice(axis, indices[i]);
+            if (!allclose(batch[i], single)) {
+                std::cerr << "FAIL micro batch axis=" << axis << "\n";
+                return 1;
+            }
+        }
+        SliceBatchOptions stream_options;
+        stream_options.num_threads = 4;
+        stream_options.window_slices = 2;
+        std::vector<std::vector<float>> streamed(indices.size());
+        reader.read_slices_batch_stream(axis, indices, stream_options,
+            [&](size_t request_pos, uint64_t, std::vector<float>&& slice) {
+                streamed[request_pos] = std::move(slice);
+            });
+        for (size_t i = 0; i < indices.size(); i++) {
+            if (!allclose(streamed[i], batch[i])) {
+                std::cerr << "FAIL micro stream axis=" << axis << "\n";
+                return 1;
+            }
+        }
+    }
+
+    auto xcol = reader.read_x_column(9, 10);
+    auto ycol = reader.read_y_column(8, 10);
+    auto zcol = reader.read_z_column(8, 9);
+    for (uint64_t x = 0; x < dx; x++)
+        if (std::abs(xcol[x] - at(x, 9, 10)) > 1e-6f) { std::cerr << "FAIL micro xcol\n"; return 1; }
+    for (uint64_t y = 0; y < dy; y++)
+        if (std::abs(ycol[y] - at(8, y, 10)) > 1e-6f) { std::cerr << "FAIL micro ycol\n"; return 1; }
+    for (uint64_t z = 0; z < dz; z++)
+        if (std::abs(zcol[z] - at(8, 9, z)) > 1e-6f) { std::cerr << "FAIL micro zcol\n"; return 1; }
+
+    auto sub = reader.read_subvolume(1, 17, 2, 19, 3, 23);
+    const uint64_t nx = 16, ny = 17, nz = 20;
+    if (sub.size() != nx * ny * nz) { std::cerr << "FAIL micro sub size\n"; return 1; }
+    for (uint64_t x = 1; x < 17; x++)
+        for (uint64_t y = 2; y < 19; y++)
+            for (uint64_t z = 3; z < 23; z++) {
+                uint64_t idx = (x - 1) * ny * nz + (y - 2) * nz + (z - 3);
+                if (std::abs(sub[idx] - at(x, y, z)) > 1e-6f) {
+                    std::cerr << "FAIL micro subvolume\n";
+                    return 1;
+                }
+            }
+
+    auto full = reader.read_full_volume();
+    if (!allclose(full, raw_data)) {
+        std::cerr << "FAIL micro full volume\n";
+        return 1;
+    }
+    if (!reader.verify(raw_path.string(), 500)) {
+        std::cerr << "FAIL micro verify\n";
+        return 1;
+    }
+
+    bool invalid_micro_size_failed = false;
+    try {
+        ConvertOptions bad = options;
+        bad.micro_size = 4;
+        convert_raw_to_blocked(raw_path.string(), (tmp / "bad_micro.b3d").string(),
+                               dx, dy, dz, bad);
+    } catch (const std::invalid_argument&) {
+        invalid_micro_size_failed = true;
+    }
+    if (!invalid_micro_size_failed) {
+        std::cerr << "FAIL invalid micro_size accepted\n";
+        return 1;
+    }
+
+    std::cout << "PASS\n";
+    return 0;
+}
+
 static int test_memory_budget() {
     std::cout << "  Memory budget parameter...";
 
@@ -983,7 +1203,8 @@ int main() {
     };
 
     run("Core:", []() {
-        return test_morton() | test_block_layout() | test_block_order();
+        return test_format_layout_helpers() | test_morton()
+             | test_block_layout() | test_block_order();
     });
 
     run("IO:", []() {
@@ -993,6 +1214,7 @@ int main() {
              | test_batch_read() | test_concurrent_adjacent_same_block_key()
              | test_reader_thread_pool_lifecycle()
              | test_batch_column_read()
+             | test_micro_tiled_roundtrip()
              | test_memory_budget();
     });
 
