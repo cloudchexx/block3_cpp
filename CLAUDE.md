@@ -111,7 +111,7 @@ BlockedFileReader
 
 - `read_x_slice` / `read_y_slice` / `read_z_slice` 现已支持切片内多线程块处理。当块数 > `num_threads × 4` 时，已排序的块列表会跨线程分片，各线程写入输出缓冲区中不重叠的 `(Y,Z)` / `(X,Z)` / `(X,Y)` 区域。
 - `read_slices_batch` / `read_slices_batch_stream` 按 block layer/window 融合读取，与单片路径共享 reader 生命周期内的持久线程池。
-- reader 的块分发策略可显式选择 `round-robin` 或 `contiguous` physical chunks；默认仍为 `round-robin`，`--read-dispatch` 仅用于 Phase 4 A/B 和回滚，不应在评审现场动态搜索。
+- reader 的块分发策略可显式选择 `round-robin` 或 `contiguous` physical chunks；默认仍为 `round-robin`，`--read-dispatch` 仅用于  A/B 和回滚，不应在评审现场动态搜索。
 
 ## 预热
 

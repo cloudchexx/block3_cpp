@@ -10,7 +10,7 @@
 | `src/` | 块转换、mmap reader、CLI、大数据测试实现 | [`src/code_map.md`](src/code_map.md) |
 | `tests/` | 库功能、并发回归和真实 CLI 进程测试 | [`tests/code_map.md`](tests/code_map.md) |
 | `tools/` | Phase 4/5 辅助脚本，例如 dispatch A/B 日志中位数比较 | 本文“辅助工具” |
-| `experiments/` | 已归档的正式实验日志、派生 CSV 和报告说明；不存放大型 `.raw` 输出 | [`experiments/CLAUDE.md`](experiments/CLAUDE.md), [`experiments/code_map.md`](experiments/code_map.md) |
+| `experiments/` | 已归档的正式实验日志、派生 CSV 和报告说明；不存放大型 `.raw` 输出，以及归档文档 | [`experiments/CLAUDE.md`](experiments/CLAUDE.md), [`experiments/code_map.md`](experiments/code_map.md) |
 | `generator_py/` | 随机三维数据生成器及 CLI/GUI/TUI | [`generator_py/code_map.md`](generator_py/code_map.md) |
 | `CMakeLists.txt` | C++17、OpenMP 和库/CLI/测试构建目标 | 本文“构建目标” |
 | `项目需求文档.md` | 数据格式、官方环境、功能和评分要求 | 原始需求文档 |
@@ -65,7 +65,7 @@ fixed-size blocks                     # Morton/Z-order 物理顺序
 
 | 目录 | 内容 |
 |---|---|
-| `experiments/phase5_20260717/` | Phase 5 正式验收归档：选定 benchmark 日志、派生 CSV、dispatch A/B 文本输出和报告说明。 |
+| `experiments/批量融合读取与读写流水线优化开发方案实验数据归档/` | 批量融合读取与读写流水线优化开发方案实验数据归档正式验收归档：选定 benchmark 日志、派生 CSV、dispatch A/B 文本输出和报告说明。 |
 
 该归档只保存文本日志和汇总结果，不保存 `benchmark_output` / `phase5_outputs` 下的大型 `.raw` 切片输出。
 
